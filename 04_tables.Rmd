@@ -1,0 +1,1745 @@
+---
+title: "Descriptive analysis of prescribing in COPD patients"
+csl: ../99_bibliography/bmj.csl
+editor_options:
+  chunk_output_type: console
+output:
+  bookdown::pdf_document2:
+    fig_caption: yes
+    keep_tex: yes
+    toc: no
+  html_document:
+    df_print: paged
+  pdf_document:
+    toc: no
+  word_document: null
+bibliography: ../99_bibliography/thesis.bib
+---
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(root.dir = "..")
+knitr::opts_chunk$set(echo = FALSE)
+
+knitr::opts_knit$set(root.dir = "..")
+
+```
+
+```{r config, include=FALSE}
+
+# Path from project directory to this file
+# NOTE: must be set in each programme separately
+subfolder <- "04_copd"
+
+# Initialise the workspace
+source(file.path(subfolder, "00_init.R"))
+
+# Load additional libraries
+library(glmmTMB)
+library(knitr)
+library(kableExtra)
+library(forcats)
+library(ggplot2)
+library(ggthemes)
+library(broom)
+
+
+# Fix a bug in the glmmTMB package (until package is updated)
+source("99_fix_glmmTMB_summary.R")
+source("99_glmmTMB_tidiers.R")
+
+# Load tabulation functionality
+source(file.path(subfolder, "00_tabulation.R"))
+
+# Set the output format for kableExtra
+format <- "latex"
+all_tables <- FALSE
+
+# Set dates (change for sensitivity analysis)
+year <- 2015
+main_start <- make_date(year, 1, 1)
+study_end <- make_date(year, 12, 31)
+
+```
+
+```{r load_data}
+
+char(practices, cohort, patients, comorb, abx, reason, presc_as, obese, smoke, 
+     aecopd, severe_aecopd, fev, mrc, flu_vacc, cons, admission, hosp_diag, ae) %>% 
+  walk(load_derived)
+
+```
+
+```{r load_methods, include = FALSE}
+
+# Load all methods used in ....
+# For more information on why certain decisions were made, look there.
+# read_chunk(file.path(subfolder, "03_derive_tables.R"))
+
+source(file.path(subfolder, "03a_derive_tables.R"))
+source(file.path(subfolder, "03b_format_tables.R"))
+```
+
+```{r add_base_var}
+
+add_base <- function(dt, var, nomatch = NA){
+  # Add variables from the baseline table to any dataset. Links by 
+  # patient ID. 
+  #
+  # Args: 
+  #   dt - data.table to add to
+  #   var - name of variable(s) to add
+  #
+  # Return:
+  #   Augmented data.table
+  
+  dt[(baseline[, .SD, .SDcols = c("patid", var)]), on = "patid", nom = nomatch]
+}
+
+```
+
+```{r tab_rate}
+
+tab_rate <- function(dt, outcome, var, group){
+  # Calculate the crude absolut and relative rate of an outcome
+  # stratified by `var`. This function ignores the `group` parameter (only
+  # included for compatibility with the tabulation functions)
+  #
+  # Args:
+  #   dt - data.table on which to calculate rates (must include column `num_abx`)
+  #   outcome - name of the outcome variable
+  #   var - name of the variable to stratify by
+  #   group - ignored
+  #
+  # Result:
+  #   a data.table with all levels of `var` in a var column and columns `rate`
+  #   (absolute rate) and `ratio` (relative rate)
+  
+  mod <- glmmTMB(as.formula(str_c(outcome, "~", var, " + (1 | pracid)")), offset = log(risk),
+                 family = nbinom2(), data = dt)
+  
+  est_cols <- c("effect", "lower", "upper")
+  to_string <- substitute(str_c(effect, " (", lower, "-", upper, ")"))
+  
+  summ <- 
+    list(rate = rate, ratio = crude) %>% 
+    invoke_map(.x = list(list(mod = mod, var = var))) %>% 
+    map(~ .[, (est_cols) := map(.SD, prty, 2), .SDcols = est_cols]) %>% 
+    map2(names(.), ~ .x[, (.y) := eval(to_string)]) %>% 
+    reduce(merge, by = c("variable", "value"))
+  
+  summ[is.na(summ)] <- "1"
+  
+  summ[, .(var = value, .all = "all", rate, ratio)]
+}
+
+```
+
+```{r table-headers}
+
+severe_header <- function(tbl, cols = 1){
+  tbl %>% 
+    add_header_above(c(" " = 1, "Mild" = cols, "Moderate" = cols, "Severe" = cols, 
+                       "Very severe" = cols, "Unknown" = cols, "All" = cols)) %>% 
+    add_header_above(c(" " = 1, "COPD severity" = 5 * cols, " " = cols))
+}
+
+mrc_header <- function(tbl, cols = 1){
+  tbl %>% 
+    add_header_above(c(" " = 1, "2" = cols, "1" = cols, "3" = cols, 
+                       "4" = cols, "5" = cols, "Unknown" = cols, "All" = cols)) %>% 
+    add_header_above(c(" " = 1, "MRC score" = 5 * cols, " " = cols))
+}
+
+ae_header <- function(tbl, cols = 1, period = "baseline"){
+  
+  hdr_2 <- c(1, 5 * cols, cols)
+  names(hdr_2) <- c(" ", str_c("Number of AECOPD during ", period," period"), " ")
+  
+  tbl %>% 
+    add_header_above(c(" " = 1, "0" = cols, "1" = cols, "2" = cols, 
+                       "3+" = cols, "severe" = cols, "All" = cols)) %>% 
+    add_header_above(hdr_2)
+}
+
+```
+
+
+# Tables
+
+(ref:cap-tab-baseline) Baseline characteristics of COPD patients in 2015
+
+```{r tbl-baseline, warning=FALSE, message=FALSE}
+
+tab_abx_rate <- partial(tab_rate, outcome = "num_abx")
+
+# Define variables to include
+tbl_def <- function(fun){
+  tab_ <- partial(tab, fun = fun)
+  
+  # Use centered variables to avoid using the smallest group as reference
+  list(
+    "Age" = tab_(age_cat_ctr ~ .),
+    "Female" = tab_(female ~ ., keep = "female"),
+    "Index of Multiple deprivation" = tab_(imd_ctr ~ .),
+    "Forced expiratory volume in 1 second (FEV1)" = tab_(fev_ctr ~ .),
+    "MRC breathlessness score" = tab_(mrc_ctr ~ .),
+    "Frequency of AECOPD at baseline" = tab_(aecopd ~ .),
+    "Asthma" = tab_(asthma ~ ., keep = "yes"),
+    "CHD" = tab_(chd ~ ., keep = "yes"),
+    "CKD" = tab_(ckd ~ ., keep = "yes"),
+    "Diabetes" = tab_(dm ~ ., keep = "yes"),
+    "Heart Failure" = tab_(hf ~ ., keep = "yes"),
+    "PAD" = tab_(pad ~ ., keep = "yes"),
+    "Stroke" = tab_(stroke ~ ., keep = "yes"),
+    "Obesity" = tab_(obese ~ ., keep = "obese"),
+    "Smoking" = tab_(smoke ~ ., keep = "smoke"),
+    "Flu vaccination" = tab_(vacc ~ ., keep = "yes")
+  )
+}
+
+# Set order
+base_ord <- with(baseline, list(levels(age_cat), "female", levels(imd), 
+                             c(levels(fev), "Missing"), c(levels(mrc), "Missing"), levels(aecopd), 
+                             "yes", "yes", "yes", "yes", "yes", "yes", "yes", 
+                             "obese", "smoke", "yes"))
+stopifnot(length(tbl_def(tbl_def(tab_default))) == length(base_ord))
+names(base_ord) <- names(tbl_def(tab_default))
+
+# Calculate all measures
+base_counts <- invoke_map(tbl_def(tab_default), .x = list(list(dt = baseline)))
+base_rates <- invoke_map(tbl_def(tab_abx_rate), .x = list(list(dt = baseline, show_miss = FALSE,
+                                                                  aux = c("risk", "num_abx", "pracid"),
+                                                                  cast = c("rate", "ratio"))))
+
+# Render the table with knitr and kableExtra
+tbl_base <- 
+  map2(base_counts, base_rates, merge, by = "var", all.x = TRUE, sort = FALSE) %T>%
+  (function(l) stopifnot(names(l) == names(base_ord))) %>% 
+  map2(base_ord, ~ setkey(.x, "var")[(.y)]) %>% 
+  walk2(., names(.), ~ if(nrow(.x) == 1) { .x[, var := cell_spec(.y, format, bold = TRUE)] }) %>% 
+  rbindlist()
+
+tbl_base[is.na(tbl_base)] <- ""
+
+
+
+tbl_base %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Patient characteristics", "n (\\%)", "Crude Rate (95\\%-CI)", "RR (95\\%-CI)"),
+    caption = if(format == "html") "Baseline table" else "(ref:cap-tab-baseline)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 2, "Number of prescriptions" = 2))%>% 
+  annotate_table(sections = base_counts)
+
+```
+
+```{r tbl-duration}
+
+# subset of abx_cohort that contains only respiratory and unknown prescriptions
+abx_resp <- abx_cohort[system %in% c("rt/ent", NA)]
+
+# classify patients as having long-term, any or no prescribing
+abx_dur <- 
+  abx_resp[, .(dur = if_else(any(as == "long-term"), "pat-long", "pat-short")), 
+           by = patid]
+abx_dur %<>% .[(baseline[, "patid"]), on = "patid"]
+abx_dur[is.na(dur), dur := "no"]
+
+tbl_duration <- function(group, caption){
+  # Create a table that shows the distribution of prescribing durations by group.
+  #
+  # Args:
+  #   group - formula with the grouping variable on the righhand side (e.g. ~ fev)
+  #   caption - the reference of the caption for LaTex (e.g. "(cap-tab-dur)")
+  #
+  # Result:
+  #   A kable table
+  
+  # Define the elements of the table
+  tbl_def <- function(group = ~ .) {
+    .f <- partial(.f_replace, with = group)
+    
+    list(
+      "% of patients" = tab(.f(dur ~ .)),
+      "% of prescriptions" = tab(.f(as ~ .))
+    )
+  }
+  
+  # Limit to respiratory (and unknown)
+  grp_nm <- as.character(rlang::f_rhs(group))
+  abx_resp <- add_base(abx_resp, grp_nm)
+  abx_dur <- add_base(abx_dur, grp_nm)
+  
+  strat <- render_tab(tbl_def(group), dt = list(abx_dur, abx_resp), combine = TRUE)
+  all <-  render_tab(tbl_def(), dt = list(abx_dur, abx_resp), combine = TRUE)
+  
+  tbl_dur <- merge(strat, all, by = "var", sort = FALSE)
+  tbl_dur %<>% .[c(1, 3, 2, 4:7)]
+  tbl_dur[, var := c("no prescribing", "short-term only", "short- and long-term", 
+                     "first course", "second course", "continuous (<6m)", "continuous (>6m)")]
+  
+  tbl_dur %>% 
+    kable(
+      format, 
+      booktabs = TRUE,
+      linesep = c(rep("", 2), "\\addlinespace\\addlinespace", rep("", 4)),
+      align = c("l", rep("r", ncol(tbl_dur) - 1)),
+      col.names = c("", rep("n (%)", ncol(tbl_dur) - 1)),
+      caption = if(format == "html") "Patterns of short- and long-term antibiotic use" else caption
+    ) %>% 
+    kable_styling() %>% 
+    landscape() %>% 
+    group_rows("A) Number/percent of patients with", 1, 3) %>% 
+    group_rows("B) Number/percent of prescribing that is", 4, 7)
+}
+```
+
+
+(ref:cap-tab-dur) Patterns of short- and long-term antibiotic use according to the number of AECOPD during follow up comparing patients (A) and prescriptions (B)
+
+```{r tbl-dur-sev, eval = all_tables}
+
+tbl_duration(~ fev, "(ref:cap-tab-dur)") %>% severe_header()
+
+```
+
+```{r tbl-dur-mrc, eval = all_tables}
+
+tbl_duration(~ mrc, "(ref:cap-tab-dur)") %>% mrc_header()
+
+```
+
+```{r tbl-dur-ae, eval = all_tables}
+
+tbl_duration(~ aecopd, "(ref:cap-tab-dur)") %>% ae_header()
+
+```
+
+```{r tbl-dur-fu}
+
+tbl_duration(~ fu_ae_cat, "(ref:cap-tab-dur)") %>% ae_header(period = "follow-up")
+
+```
+
+
+
+```{r calc-rates}
+
+# Tabulate the rates in the categories
+
+rate_in_group <- function(dt, grp_var, exp_var, l, na_as_lvl = FALSE){
+  # Estimate the rate in a severity (and exposure) subset of the dataset using 
+  # negative binomial regression 
+  #
+  # Args:
+  #   dt - data.table with the data
+  #   grp_var - the variable on which to group ("all" for no subsetting)
+  #   exp_var - the name of the exposure variable
+  #   l - level of the exposure variable to consider 
+  #
+  # Result:
+  #   data.table with estimate and CI in X rows, where x is the number of 
+  #   levels of the group variable
+  
+  by_vars <- c("patid", "pracid", "risk", (if(grp_var == "all") NULL else grp_var))
+  
+  dat <- 
+    dt[baseline, on = "patid"] %>% 
+     .[, .(N = sum(get(exp_var) == l, na.rm = TRUE)), 
+       by = c(by_vars)]
+  
+  if(grp_var == "all"){
+    mod <- glmmTMB(formula = N ~ (1 | pracid), 
+                   family = nbinom2, offset = log(risk), data = dat)
+  } else {
+    if(na_as_lvl){
+      dat[[grp_var]] <- fct_explicit_na(dat[[grp_var]], "miss")
+    }
+    
+    mod <- glmmTMB(as.formula(str_c("N ~ + ", grp_var, "+ (1 | pracid)")), 
+                   family = nbinom2, offset = log(risk), data = dat)
+  }
+  
+  mu <- as.vector(summary(mod)$coefficients$cond[, 1])
+  mu[-1] <- mu[-1] + mu[1]
+  if(grp_var == "all") C <- 1 else C <- cbind(1, contrasts(dat[[grp_var]]))
+  se <- diag(sqrt(C %*% vcov(mod)[[1]] %*% t(C)))
+  
+  res <- data.table(rate = 365 * exp(mu))
+  res[, c("lower", "upper") := norm_ci(mu + log(365), se)]
+  res[, c("rate", "lower", "upper") := map(.SD, prty, 2), .SDcols = c("rate", "lower", "upper")]
+  res[, .(var = l, grp = (if(grp_var == "all") grp_var else levels(dat[[grp_var]])), rate, ci = str_c(lower, upper, sep = ", "))]
+}
+
+```
+
+
+```{r tbl-antibiotics}
+
+tbl_antibiotics <- function(group, caption, mk_tbl = TRUE){
+  # Define the elements of the table
+  tbl_def <- function(group = ~ .) {
+    .f <- partial(.f_replace, with = group)
+    
+    tab(.f(class_desc ~ .), fun = tab_perc)
+  }
+  
+  row_order <- c("first line", "second line", "azithromycin", 
+                 "flucloxacillin", "nitrofurantoin", "other")
+  
+  grp_nm <- as.character(rlang::f_rhs(group))
+  
+  # Tabulate classes
+  strat <- tbl_def(group)(add_base(abx_class, grp_nm, nomatch = 0))
+  all <- tbl_def(~ .)(add_base(abx_class, grp_nm, nomatch = 0))
+
+  tbl_abx_perc <- merge(strat, all, by = "var", all = TRUE)
+  
+  setkey(tbl_abx_perc, "var")
+  tbl_abx_perc %<>% .[row_order]
+  
+  # Calculate the rates
+  rate_abx <- 
+    unique(abx_class$class_desc) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = abx_class, grp_var = grp_nm, exp_var = "class_desc", na_as_lvl = TRUE)
+  
+  rate_all <- unique(abx_class$class_desc) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = abx_class, grp_var = "all", exp_var = "class_desc", na_as_lvl = TRUE)
+  
+  if(mk_tbl){
+    # Format as a kable
+    
+    tbl_abx_rate <-
+      map2(rate_abx, rate_all, rbind) %>% 
+      map(~  .[, grp := factor(grp, levels = grp)]) %>% 
+      map(~  .[, rate := str_c(rate, " (", ci, ")")]) %>% 
+      map_df(dcast, var ~ grp, value.var = "rate")
+    
+    tbl_abx <- merge(tbl_abx_perc, tbl_abx_rate, by = "var", sort = FALSE) %>% copy()
+    
+    # Bring rates into table format  
+    n_lvls <- nrow(rate_abx[[1]]) + 1
+    cast_order <- c(1, unlist(map(1 + 1:n_lvls, ~ c(., . + n_lvls))))
+    
+    setcolorder(tbl_abx, cast_order)
+  
+    tbl_abx[var == "other", var := cell_spec("Other antibiotics", format, bold = TRUE)]
+    
+    # Render the table
+    tbl_abx %>% 
+      kable(
+        format, 
+        booktabs = TRUE,
+        align = c("l", rep(c("c", "r"), (ncol(tbl_abx) - 1) / 2)),
+        escape = FALSE,
+        col.names = c(" ", rep(c("\\%", "Rate (95\\%-CI)"), (ncol(tbl_abx) - 1) / 2)),
+        caption = if(format == "html") "Antibiotic usage" else caption
+      ) %>% 
+      kable_styling() %>% 
+      landscape() %>% 
+      group_rows("Treatment for acute exacerbation", 1, 3) %>% 
+      group_rows("Treatment for other conditions", 4, 5)
+  } else{
+    list(perc = tbl_abx_perc,
+         rate = map2_df(rate_abx, rate_all, rbind))
+  }
+}
+
+```
+
+
+(ref:cap-tab-abx-sev) Relative importance of antibiotic substances by COPD severity
+
+```{r tbl-abx-sev, eval = all_tables}
+
+tbl_antibiotics(~ fev, "(ref:cap-tab-abx-sev)") %>% severe_header(2)
+
+```
+
+(ref:cap-tab-abx-mrc) Relative importance of antibiotic substances by MRC score
+
+```{r tbl-abx-mrc, eval = all_tables}
+
+tbl_antibiotics(~ mrc, "(ref:cap-tab-abx-mrc)") %>% mrc_header(2)
+
+```
+
+
+(ref:cap-tab-abx-ae) Relative importance of antibiotic substances by number of AECOPD during baseline year
+
+```{r tbl-abx-ae, eval = all_tables}
+
+tbl_antibiotics(~ aecopd, "(ref:cap-tab-abx-ae)") %>% ae_header(2)
+
+```
+
+
+(ref:cap-tab-abx-fu) Relative importance of antibiotic substances by number of AECOPD during follow-up
+
+```{r tbl-abx-fu}
+
+tbl_antibiotics(~ fu_ae_cat, "(ref:cap-tab-abx-fu)") %>% ae_header(2, period = "follow-up")
+
+```
+
+```{r reclass-indication}
+
+# Collapse categories
+abx_cohort[system == "rt/ent" & 
+           condition %in% c("symptoms of ae", "pneumonia", "acute bronchitis", 
+                            "bronchiectasis", "chronic bronchitis", "influenza",
+                            "unspecific lrti"),
+           condition := "copd related"]
+
+abx_cohort[system == "rt/ent" & 
+           condition %in% c("cold", "ear", "ear symptoms", "hi epiglottitis", "laryngitis",
+                            "sinusitis", "sore throat", "unspecific urti", "urti symptoms"),
+           condition := "urti"]
+
+abx_cohort[system == "rt/ent" & 
+           condition %in% c("allergic condition", "asthma", "parotitis", 
+                            "other symptoms", "unspecific rti"),
+           condition := "other rti"]
+
+abx_cohort[system == "urogenital tract", condition := "urogenital tract"]
+
+abx_cohort[system == "skin and wounds" & condition %in% c("wounds", "bites"),
+           c("system", "condition") := .("other", NA_character_)]
+
+abx_cohort[system == "skin and wounds", c("system", "condition") := "skin"]
+
+abx_cohort[system %in% c("multiple systems", "misc"), system := "other"]
+abx_cohort[, system := fct_drop(system)]
+
+abx_cohort[!is.na(system) & is.na(condition), condition := "other"]
+
+```
+
+```{r tbl-indication}
+
+tbl_indication <- function(group, caption){
+
+  grp_nm <- as.character(rlang::f_rhs(group))
+  
+  dt <- add_base(abx_cohort, grp_nm)
+  
+  # Tabulate the proportions within the  categories
+  tbl_sys <- merge(
+    tab(as.formula(str_c("system ~ ", grp_nm)), fun = tab_perc, show_miss = "%")(add_base(abx_cohort, grp_nm)),
+    tab(system ~ ., fun = tab_perc, show_miss = "%")(dt),
+    by = "var", sort = FALSE
+  )
+  setkey(tbl_sys, "var")
+  
+  tbl_cond <- merge(
+    tab(as.formula(str_c("condition ~ ", grp_nm)), fun = tab_perc, show_miss = FALSE)(dt),
+    tab(condition ~ ., fun = tab_perc, show_miss = FALSE)(dt)
+  )
+  setkey(tbl_cond, "var")
+  
+  dt[is.na(system), c("system", "condition") := "Missing"] # Count miss as separate classes for rates
+  conds <- c("copd related", "cough", "urti", "other rti")
+  
+  tbl_ind_perc <- 
+    rbind(
+      tbl_sys["rt/ent"],
+      tbl_cond[(conds)],
+      
+      tbl_sys["urogenital tract"],
+      
+      tbl_sys["skin"],
+      
+      tbl_sys[c("other", "Missing")],
+      fill = TRUE
+    )
+
+  tbl_ind_perc %<>% .[!is.na(all)]
+  tbl_ind_perc[is.na(tbl_ind_perc)] <- "0.0"
+
+  rate_systems <- 
+    unique(dt$system) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = dt, grp_var = grp_nm, exp_var = "system", na_as_lvl = TRUE)
+  
+  rate_systems_all <- 
+    unique(dt$system) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = dt, grp_var = "all", exp_var = "system", na_as_lvl = TRUE)
+  
+  rate_conditions <- 
+    unique(dt$condition) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = dt, grp_var = grp_nm, exp_var = "condition", na_as_lvl = TRUE)
+  
+  rate_conditions_all <- 
+    unique(dt$condition) %>% 
+    set_names() %>% 
+    map(rate_in_group, dt = dt, grp_var = "all", exp_var = "condition", na_as_lvl = TRUE)
+  
+  tbl_ind_rate <-
+      c(
+        map2(rate_systems, rate_systems_all, rbind),
+        map2(rate_conditions[conds], rate_conditions_all[conds], rbind)
+      ) %>% 
+      map(~  .[, grp := factor(grp, levels = grp)]) %>% 
+      map(~  .[, rate := str_c(rate, " (", ci, ")")]) %>% 
+      map_df(dcast, var ~ grp, value.var = "rate")
+
+  # Combine proportion and rates and bring rows into desired order
+  tbl_ind <- merge(tbl_ind_perc, tbl_ind_rate, by = "var", sort = FALSE) %>% copy()
+  
+  n_lvls <- nrow(rate_systems[[1]]) + 1
+  cast_order <- c(1, unlist(map(1 + 1:n_lvls, ~ c(., . + n_lvls))))
+  
+  setcolorder(tbl_ind, cast_order)
+  
+  tbl_ind[var == "rt/ent", var := cell_spec("Respiratory tract", format, bold = TRUE)]
+  tbl_ind[var == "urogenital tract", var := cell_spec("Urogenital tract", format, bold = TRUE)]
+  tbl_ind[var == "skin", var := cell_spec("Skin and soft tissue", format, bold = TRUE)]
+  tbl_ind[var %in% c("other", "Missing"), var := cell_spec(str_to_title(var), format, bold = TRUE)]
+
+  # Create the markdown table
+  
+  indent_pos <- 
+    which(tbl_ind$var %in% c(tbl_cond$var))
+  
+  tbl_ind %>% 
+    kable(
+      format, 
+      booktabs = TRUE,
+      linesep = "",
+      align = c("l", rep(c("r", "l"), (ncol(tbl_ind) - 1) / 2)),
+      escape = FALSE,
+      col.names = c(" ", rep(c("\\%", "Rate (95\\%-CI)"), (ncol(tbl_ind) - 1) / 2)),
+      caption = if(format == "html") "Proportion and rates by indication" else caption
+    ) %>% 
+    kable_styling() %>% 
+    landscape() %>% 
+    add_indent(indent_pos)
+}
+
+
+```
+
+
+
+(ref:cap-tab-ind-sev) Proportion and rates of antibiotic prescribing for each indication for prescribing by COPD severity
+
+```{r tbl-ind-sev, eval = all_tables}
+
+tbl_indication(~ fev, "(ref:cap-tab-ind-sev)") %>% severe_header(2)
+
+```
+
+(ref:cap-tab-ind-mrc) Proportion and rates of antibiotic prescribing for each indication for prescribing by MRC score
+
+```{r tbl-ind-mrc, eval = all_tables}
+
+tbl_indication(~ mrc, "(ref:cap-tab-ind-mrc)") %>% mrc_header(2)
+
+```
+
+
+(ref:cap-tab-ind-ae) Proportion and rates of antibiotic prescribing for each indication for prescribing by number of AECOPD during baseline year
+
+```{r tbl-ind-ae, eval = all_tables}
+
+tbl_indication(~ aecopd, "(ref:cap-tab-ind-ae)") %>% ae_header(2)
+
+```
+
+
+(ref:cap-tab-ind-fu) Proportion and rates of antibiotic prescribing for each indication for prescribing by number of AECOPD during follow-up
+
+```{r tbl-ind-fu, warning = FALSE, message = FALSE}
+
+tbl_indication(~ fu_ae_cat, "(ref:cap-tab-ind-fu)") %>% ae_header(2, period = "follow-up")
+
+```
+
+
+
+```{r tbl-pattern}
+
+tab_aecopd_rate <- partial(tab_rate, outcome = "fu_aecopd")
+tab_sev_ae_rate <- partial(tab_rate, outcome = "fu_sev_ae")
+tab_ddd_rate <- partial(tab_rate, outcome = "num_ddd")
+
+tbl_pattern <- function(group, caption){
+  
+  form <- as.formula(str_c(group, "~ ."))
+  tbl_def_pat <- list(
+    "Number of Patients" = 
+      tab(form),
+    "Rate of moderate AE" = 
+      tab(form, fun = tab_aecopd_rate, aux = list(c("pracid", "risk", "fu_aecopd")), cast = "rate"),
+    "Rate of severe AE" = 
+      tab(form, fun = tab_sev_ae_rate, aux = list(c("pracid", "risk", "fu_sev_ae")), cast = "rate"),
+    "Rate of prescribing" = 
+      tab(form, fun = tab_abx_rate, aux = list(c("pracid", "risk", "num_abx")), cast = "rate"),
+    "Rate of DDDs" = 
+      tab(form, fun = tab_ddd_rate, aux = list(c("pracid", "risk", "num_ddd")), cast = "rate")
+  )
+  
+  tbl_def_abx <- list(
+    "Proportion of prescriptions that are long-term" = 
+      tab(as.formula(str_c("as ~ ", group)), tab_perc, keep_only = "long-term"),
+    "Proportion of prescriptions that are second line therapy" = 
+      tab(as.formula(str_c("class_desc ~ ", group)), tab_perc, keep_only = "second line")
+  )
+  
+  tbl_pat <- 
+    render_tab(tbl_def_pat, list(baseline)) %>% 
+    map2(as.character(1:5), setnames, old = "all") %>%  
+    reduce(merge, by = "var", sort = FALSE)
+  
+  dt1 <- add_base(abx_cohort, group)[, .(get(group), as = fct_other(as, keep = "long-term"))]
+  setnames(dt1, "V1", group)
+  dt2 <- add_base(abx_class, group)[, .(get(group), class_desc = fct_other(class_desc, keep = "second line"))]
+  setnames(dt2, "V1", group)
+  
+  tbl_abx <- 
+    render_tab(tbl_def_abx, list(dt1, dt2)) %>% 
+    map(melt, id = "var", measure = levels(dt1[[group]])) %>% 
+    map( ~ .[, -1]) %>% 
+    reduce(merge, by = "variable", sort = FALSE)
+  
+  tbl <- 
+    merge(tbl_pat, tbl_abx, by.x = "var", by.y = "variable", sort = FALSE)
+  
+  hdr_1 <- rep(1, ncol(tbl))
+  names(hdr_1) <- c(" ", linebreak("Number of \n patients", align = "c", double_escape = T),
+          linebreak("Rate of AE ", align = "c", double_escape = T),  
+          linebreak("Rate of \n severe AE", align = "c", double_escape = T),  
+          linebreak("Rate of \nantibiotic presc.", align = "c", double_escape = T),  
+          linebreak("Rate of \n DDDs", align = "c", double_escape = T),  
+          linebreak("Proportion of \n prescriptions \n that are \n long-term", align = "c", double_escape = T), 
+          linebreak("Proportion of \n prescriptions \n that are \n 2nd line therapy", align = "c", double_escape = T))
+  
+  tbl %>%   
+    kable(
+      format, 
+      booktabs = TRUE,
+      linesep = "",
+      align = c("l", rep("r", ncol(tbl) - 1)),
+      escape = FALSE,
+      col.names = c(" ", "N (\\%)", rep("Rate (95\\%-CI)", ncol(tbl_pat) - 2), "\\%", "\\%"),
+      caption = if(format == "html") "Patterns of prescribing" else caption
+    ) %>% 
+    kable_styling() %>% 
+    add_header_above(hdr_1, escape = FALSE) %>% 
+    landscape()
+}
+  
+```
+
+
+(ref:cap-tab-pat-sev) Patterns of COPD exacerbations and antibiotic prescribing by COPD severity
+
+```{r tbl-pat-sev, eval = all_tables}
+
+tbl_pattern("fev", "(ref:cap-tab-pat-sev)")
+
+```
+
+(ref:cap-tab-pat-mrc) Patterns of COPD exacerbations and antibiotic prescribing by MRC score
+
+```{r tbl-pat-mrc, eval = all_tables}
+
+tbl_pattern("mrc", "(ref:cap-tab-pat-mrc)")
+
+```
+
+
+(ref:cap-tab-pat-ae) Patterns of COPD exacerbations and antibiotic prescribing by number of AECOPD during baseline year
+
+```{r tbl-pat-ae, eval = all_tables}
+
+tbl_pattern("aecopd", "(ref:cap-tab-pat-ae)")
+
+```
+
+
+
+```{r tbl-cross}
+
+tbl_cross <- function(var1, var2, method = "rate", with_ci = TRUE){
+
+  if(method == "rate"){
+    form <- as.formula(str_c("num_abx ~ ", var1, "*", var2, " + ",
+                             "age_scaled * female + (1 | pracid)"))
+    mod <- glmmTMB(form, family = nbinom2, 
+                   data = baseline, offset = log(risk))
+    
+    dt <- unique(baseline[, c(var1, var2), with = FALSE])
+    dt[, c("age_scaled", "pracid", "risk") := .(0, NA_integer_, 365)]
+    dt[, female := factor(0, c(0, 1), c("male", "female"))]
+    dt <- dt[!is.na(get(var1)) & !is.na(get(var2))]
+    
+    setorderv(dt, c(var1, var2))
+    
+    pred <- predict(mod, dt, type = "link", se.fit = TRUE)
+    
+    dt[, est := exp(pred$fit)]
+    dt[, c("lower", "upper") := norm_ci(pred$fit, pred$se.fit)]
+    dt[, c("est", "lower", "upper") := map(.SD, ~ prty(., 2)), 
+       .SDcols = c("est", "lower", "upper")]
+    dt[, ci := str_c(lower, upper, sep = "-")]
+    
+    setnames(dt, c(var1, var2), c("var1", "var2"))
+    
+    res <- dt[, c("var1", "var2", "est", (if(with_ci) "ci" else NULL)), with = FALSE]
+  } else {
+    combs <- expand.grid(levels(baseline[[var1]]), levels(baseline[[var2]]), stringsAsFactors = FALSE)
+    res <- pmap_df(combs,
+                ~ data.table(var1 = ..1, 
+                             var2 = ..2,
+                             est = nrow(baseline[get(var1) == ..1 & get(var2) == ..2])))
+  }
+  
+  if(with_ci & method == "rate"){
+    res[, est := str_c(est, " (", ci, ")")]
+  }
+  
+  res %>% dcast(var1 ~ var2, value.var = "est")
+}
+
+
+```
+
+(ref:cap-tab-cross-count-sev) Number of patients by FEV1 and by number of AECOPD during baseline year
+
+```{r tbl-cross-count-sev, eval = all_tables}
+
+tbl_cross("fev", "aecopd", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("Copd severity", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-sev)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD in baseline year" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+(ref:cap-tab-cross-sev) Rate of antibiotic prescribing in 2015 by FEV1 and by number of AECOPD during baseline year
+
+```{r tbl-cross-sev, eval = all_tables}
+
+tbl_cross("fev", "aecopd") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("Copd severity", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-sev)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD in baseline year" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+
+(ref:cap-tab-cross-count-mrc) Number of patients by FEV1 and by MRC score
+
+```{r tbl-cross-count-mrc, eval = all_tables}
+
+tbl_cross("fev", "mrc", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV1", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-mrc)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "1" = 1, "2" = 1, "3" = 1, 
+                     "4" = 1, "5" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "MRC score" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+
+(ref:cap-tab-cross-mrc) Rate of antibiotic prescribing in 2015 by FEV1 and by MRC score
+
+```{r tbl-cross-mrc, eval = all_tables}
+
+tbl_cross("fev", "mrc") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV1", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-mrc)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "1" = 1, "2" = 1, "3" = 1, 
+                     "4" = 1, "5" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "MRC score" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+
+(ref:cap-tab-cross-count-ae) Number of patients by MRC score and by number of AECOPD during baseline year
+
+```{r tbl-cross-count-ae, eval = all_tables}
+
+tbl_cross("mrc", "aecopd", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC score", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-ae)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD in baseline year" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+(ref:cap-tab-cross-ae) Rate of antibiotic prescribing in 2015 by MRC score and by number of AECOPD during baseline year
+
+```{r tbl-cross-ae, eval = all_tables}
+
+tbl_cross("mrc", "aecopd") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC score", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-ae)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD in baseline year" = 5), escape = FALSE) %>% 
+  landscape()
+
+
+```
+
+
+(ref:cap-tab-cross-count-fu) Number of patients by AECOPD during baseline and by number of AECOPD during follow-up
+
+```{r tbl-cross-count-fu}
+
+tbl_cross("aecopd", "fu_ae_cat", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("AECOPD (baseline)", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+(ref:cap-tab-cross-ae-fu) Rate of antibiotic prescribing in 2015 by AECOPD during baseline and by number of AECOPD during follow-up
+
+```{r tbl-cross-ae-fu, eval = all_tables}
+
+tbl_cross("aecopd", "fu_ae_cat") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("AECOPD (baseline)", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-ae-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+
+```
+
+(ref:cap-tab-cross-count-fu-sev) Number of patients by FEV1 and by number of AECOPD during follow-up
+
+```{r tbl-cross-count-fu-sev}
+
+tbl_cross("fev", "fu_ae_cat", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV1", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-fu-sev)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+(ref:cap-tab-cross-sev-fu) Rate of antibiotic prescribing in 2015 by FEV1 and by number of AECOPD during follow-up
+
+```{r tbl-cross-sev-fu, eval = all_tables}
+
+tbl_cross("fev", "fu_ae_cat") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV1", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-sev-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+
+```
+
+
+(ref:cap-tab-cross-count-fu-mrc) Number of patients by MRC score and by number of AECOPD during follow-up
+
+```{r tbl-cross-count-fu-mrc}
+
+tbl_cross("mrc", "fu_ae_cat", method = "count") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-count-fu-mrc)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+```
+
+
+(ref:cap-tab-cross-mrc-fu) Rate of antibiotic prescribing in 2015 by MRC score and by number of AECOPD during follow-up
+
+```{r tbl-cross-mrc-fu, eval = all_tables}
+
+tbl_cross("mrc", "fu_ae_cat") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC score", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-mrc-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+
+```
+
+
+
+(ref:cap-tab-cross-all-fu) Number of patients in 2015 by number of AECOPD during follow-up
+
+```{r tbl-cross-count-all-fu}
+
+# Combine all three measures
+
+rbind(
+  tbl_cross("fev", "fu_ae_cat", method = "count"), 
+  tbl_cross("mrc", "fu_ae_cat", method = "count"), 
+  tbl_cross("aecopd", "fu_ae_cat", method = "count") 
+) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("", rep("N", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-all-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape() %>% 
+  group_rows("FEV1 according to GOLD criteria", 1, 4) %>% 
+  group_rows("MRC breathlessness score", 5, 9) %>% 
+  group_rows("Number of AECOPD during baseline", 10, 14)
+  
+
+
+```
+
+
+
+(ref:cap-tab-cross-all-fu) Rate of antibiotic prescribing in 2015 by number of AECOPD during follow-up
+
+```{r tbl-cross-all-fu}
+
+# Combine all three measures
+
+rbind(
+  tbl_cross("fev", "fu_ae_cat"), 
+  tbl_cross("mrc", "fu_ae_cat"), 
+  tbl_cross("aecopd", "fu_ae_cat") 
+) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-cross-all-fu)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape() %>% 
+  group_rows("FEV1 according to GOLD criteria", 1, 4) %>% 
+  group_rows("MRC breathlessness score", 5, 9) %>% 
+  group_rows("Number of AECOPD during baseline", 10, 14)
+  
+
+
+```
+
+
+
+
+
+
+```{r tbl-utilisation}
+
+tbl_util <- function(group, caption){
+  tbl_def <- function(group = ~ .) {
+    .f <- partial(.f_replace, with = group)
+  
+    list(
+      "Consultations" = tab(.f(num_cons ~ .)),
+      "Hospitalisations" = list(
+        "Number of stays" = tab(.f(num_hosp ~ .)),
+        "with respiratory infection" = tab(.f(num_hosp_resp ~ .)),
+        "Days in hospital" = tab(.f(day_hosp ~ .))
+      ),
+      "Emergency department visits" = tab(.f(num_ae ~ .)),
+      "Died during follow-up" = tab(.f(death ~ .), keep = "yes")
+    )
+  }
+  
+  
+  tab_diff <- function(dt, var, group){
+  
+    if(length(group) > 1)
+      stop("Only one grouping variable allowed for test of group differences")
+  
+    if(is.numeric(dt[[var]])){
+      res <- kruskal.test(dt[[var]], dt[[group]])
+    } else if(is.factor(dt[[var]]) || is.character(dt[[var]])){
+      res <- chisq.test(table(dt[[var]], dt[[group]], useNA = "ifany"))
+    } else {
+      stop("Variable must be numeric or categorical (factor or character)")
+    }
+  
+    data.table(var = "p.value", value = round(max(res$p.value, 0.001, 3)))
+  }
+  
+  grp_nm <- as.character(rlang::f_rhs(group))
+  
+  strat <- render_tab(tbl_def(group), dt = add_base(util, grp_nm, nomatch = 0),
+                      combine = TRUE)
+  all <- render_tab(tbl_def(), dt = add_base(util, grp_nm, nomatch = 0), combine = TRUE)
+  
+  p_vals <- map_df(c("num_cons", "num_hosp", "num_hosp_resp", "day_hosp", "num_ae", "death"),
+                   tab_diff, dt = add_base(util, grp_nm, nomatch = 0), group = grp_nm)
+  
+  tbl_util <- cbind(strat, all[, !("var")], p_vals[, !("var")])
+  tbl_util %>% 
+    kable(
+    format,
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", ncol(tbl_util) - 1)),
+    escape = FALSE,
+    col.names = c("", rep(linebreak("mean (sd)/\n n (\\%)", "c"), ncol(tbl_util) - 2), "p-value"),
+    caption = if(format == "html") "Healthcare utilisation" else caption
+  ) %>%
+  kable_styling() %>%
+  landscape() %>%
+  group_rows("Inpatient visits", 2, 4)
+}
+
+```
+
+
+
+(ref:cap-tab-util-sev) Healthcare utilisation by COPD severity
+
+```{r tbl-util-sev, eval = all_tables}
+
+tbl_util(~ fev, "(ref:cap-tab-util-sev)") %>% severe_header()
+
+```
+
+(ref:cap-tab-util-mrc) Healthcare utilisation by MRC score
+
+```{r tbl-util-mrc, eval = all_tables}
+
+tbl_util(~ mrc, "(ref:cap-tab-util-mrc)") %>% mrc_header()
+
+```
+
+
+(ref:cap-tab-util-ae) Healthcare utilisation by number of AECOPD during baseline year
+
+```{r tbl-util-ae, eval = all_tables}
+
+tbl_util(~ aecopd, "(ref:cap-tab-util-ae)") %>% ae_header()
+
+```
+
+
+
+
+
+# Figures
+
+
+```{r fig-abx-rate, fig.cap = "Average annual rate of first line, second line and specific antibiotic therapies by the number of AECOPD per year. A. First line antibiotic therapy, B. Second line antibiotic therapy, C. Azithromycin as a marker of phrophylactic antibiotic use in COPD, D. Nitrofurantoin as a marker of prescribing for urinary tract infection, E. Flucloxacillin as a marker for prescribing for skin and soft tissue infections", fig.width=5.5, fig.height=7.1, dpi=300}
+
+# Calculate the rates (and percentages) by antibiotic
+abx_rates <- tbl_antibiotics(~ fu_ae_cat, "(ref:cap-tab-abx-fu)", mk_tbl = FALSE)
+
+# Extract the rates and compute point estimates / confidence intervals
+abx_rates <- copy(abx_rates$rate) # copy to get rid of "shallow-copy" data.table message
+abx_rates[, lower := str_extract(ci, "^.*(?=,)")]
+abx_rates[, upper := str_extract(ci, "(?<=,).*$")]
+abx_rates[, c("rate", "lower", "upper") := map(.SD, as.numeric), .SDcols = c("rate", "lower", "upper")]
+
+
+# Order x-axis
+abx_rates[, grp := factor(grp, c("0", "1", "2", "3+", "1+ severe"), 
+                               c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"))]
+
+# Define plot
+g <- ggplot(NULL, aes(grp, rate, ymin = lower, ymax = upper, colour = grp)) + 
+  geom_pointrange() +
+  facet_wrap(~ var, ncol = 2) +
+  scale_color_viridis_d(option = "plasma", end = 0.6) + 
+  guides(colour = FALSE) + 
+  labs(x = "", y = "") + 
+  theme_minimal() + 
+  theme(panel.grid.minor.y = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0),
+        axis.title = element_text(margin = margin(l = 0, r = 10, b = 0, t = 10)))
+
+# Plot first line
+g_first <- g %+% 
+  (abx_rates[grp != "all" & var == "first line"] %>% 
+           .[, var := "A. First line"])%+%
+  aes(size = 1) +
+  scale_y_continuous(breaks = 0:7, labels = partial(scales::number, accuracy = 0.1)) + 
+  scale_size_identity() + 
+  labs(y = "Rate per year\n") +
+  coord_cartesian(ylim = c(0, 7))
+
+abx_types <- c("second line", "azithromycin", "nitrofurantoin", "flucloxacillin", "other")
+
+# Shorten the labels for the smaller subplots
+abx_rates[, grp := fct_recode(grp, `1 m.` = "1 mod.", `2 m.` = "2 mod.", 
+                                   `3+ m.` = "3+ mod.", `1+ s.` = "1+ severe")]
+
+g_other <- g %+% 
+  (abx_rates[grp != "all" & !var %in% c("first line", "other")] %>% 
+           .[, var := factor(var, abx_types, 
+                             str_c(c("B", "C", "D", "E", "F"), ". ", str_to_title(abx_types)))]) +
+  scale_y_continuous(breaks = c(0, .5, 1)) + 
+  coord_cartesian(ylim = c(0, 1.25)) +
+  labs(x = "\nNumber of AECOPD during follow-up", 
+       y = "Rate per year\n") + 
+  theme(panel.spacing.y = unit(1, "cm"),
+        panel.spacing.x = unit(.5, "cm"))
+  
+
+ggpubr::ggarrange(g_first, g_other, nrow = 2, ncol = 1, heights = c(2, 3))
+
+```
+
+
+```{r fig-dur1, eval = all_tables, fig.cap= "Proportion of patients and prescribing made up by long-term prescribing (this figure is not finished as I am unsure whether it can be useful)"}
+
+
+dur_labs <- 
+  add_base(abx_dur, "fev", nomatch = 0) %>% 
+    .[, .N, by = .(fev, dur)] %>% 
+    .[order(fev, dur)] %>% 
+    .[, .(dur, perc = cumsum(N / sum(N))), by = fev]
+dur_labs[, midpoint := (perc + c(0, perc[-.N])) / 2, by = fev]
+
+label_map <- c("no" = "none", "pat-long" = ">6m", "pat-short" = "<6m")
+dur_labs[, dur := label_map[dur]]
+
+add_base(abx_resp, "fev", nomatch = 0) %>% 
+  ggplot(aes(1, fill = as)) + 
+  geom_bar(aes(y = ..count.. / tapply(..count.., ..PANEL.., sum)[..PANEL..]), 
+           position = "stack", width = 0.5) + 
+  geom_segment(data = dur_labs, aes(x = 1.25, y = perc, xend = 1.35, yend = perc), inherit.aes = FALSE) + 
+  geom_text(data = dur_labs, aes(1, midpoint, label = dur), inherit.aes = FALSE,
+            hjust = 0, nudge_x = 0.3) + 
+  #scale_x_continuous(expand = expand_scale(add = 0.4)) + 
+  scale_y_continuous(labels = scales::percent, breaks = seq(0, 1, by = 0.2)) + 
+  scale_fill_brewer(palette = "Paired") + 
+  facet_grid(. ~ fev, scales = "free") + 
+  coord_cartesian(xlim = c(0.75, 1.7)) + 
+  labs(x = "", y = "") + 
+  theme_minimal() + 
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey85"),
+        panel.grid.minor.y = element_line(colour = "grey90"),
+        axis.text.x = element_blank()
+        )
+
+```
+
+```{r fig-dur2, eval = all_tables, fig.cap = "Left: Proportion of patients that received no prescribing, prescribing up to 6 months and prescribing of more than 6 months by COPD severity. Right: Proportion of prescribing accounted for by first prescriptions, second prescriptions ('re-prescribing'), short-term prescribing (<6 months) and long-term prescribing (>6 months)."}
+
+g1 <- 
+  add_base(abx_resp, "fev")[abx_dur, on = "patid", nomatch = 0][!is.na(fev)] %>% 
+  ggplot(aes(dur, fill = as)) + 
+  geom_bar(aes(y = ..count.. / tapply(..count.., ..PANEL.., sum)[..PANEL..])) + 
+  scale_x_discrete(limits = c("no", "pat-short", "pat-long"),
+                   labels = function(x) label_map[x], 
+                   expand = expand_scale(add = 1)) + 
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent, breaks = seq(0, 1, by = 0.2)) + 
+  scale_fill_brewer(palette = "Paired") + 
+  facet_grid(fev ~ ., scales = "free", drop = FALSE) + 
+  coord_flip() + 
+  labs(x = "", y = "Proportion of prescriptions", 
+       fill = "Type of prescription") + 
+  theme_minimal() + 
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_line(colour = "grey85"),
+        panel.grid.minor.x = element_line(colour = "grey90"),
+        axis.text.y = element_text(hjust = 0.5),
+        legend.position = "top")
+
+
+g2 <- 
+  add_base(abx_dur, "fev")[!is.na(fev)] %>% 
+  ggplot(aes(dur)) + 
+  geom_bar(aes(y = ..count.. / tapply(..count.., ..PANEL.., sum)[..PANEL..])) +
+  scale_x_discrete(position = "top", limits = c("no", "pat-short", "pat-long"),
+                   expand = expand_scale(add = 1)) +
+  scale_y_reverse(labels = scales::percent, breaks = seq(0, 1, by = 0.2)) + 
+  facet_grid(fev ~ ., scales = "free", switch = "y") + 
+  coord_flip(ylim = c(0, 1)) + 
+  labs(x = "", y = "Proportion of patients") + 
+  theme_minimal() + 
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.x = element_line(colour = "grey85"),
+        panel.grid.minor.x = element_line(colour = "grey90"),
+        axis.text.y = element_blank())
+
+
+ggpubr::ggarrange(g2, g1, ncol = 2, common.legend = TRUE, widths = c(9, 11))
+
+```
+
+```{r fig-ind, fig.cap="Indication for the antibiotic prescription, grouped by the number of AECOPD during follow-up. Excludes prescriptions with missing indication.", fig.width=6.5, fig.height=3, dpi=300}
+
+fig_ind_data <- add_base(abx_cohort, "fu_ae_cat", nomatch = 0) %>% 
+  .[!is.na(system)] %>% 
+  .[is.na(condition), condition := "other"] %>% 
+  .[, .N, by = .(fu_ae_cat, system, condition)] %>% 
+  .[, .(system, condition, N, p = N / sum(N)), by = fu_ae_cat]
+
+
+fig_ind_data[, system := factor(system, levels = c("rt/ent", "urogenital tract", "skin", "other"))]
+fig_ind_data[, condition := factor(condition, levels = c("copd related", "cough", "urti", "other rti", "urogenital tract", "skin", "other"), labels = c("COPD related", "Cough", "URTI", "Other RTI", "Urogenital tract", "Skin", "Other"))]
+
+ggplot(fig_ind_data, aes(system, p, fill = condition)) + 
+  geom_col(position = "stack") + 
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) + 
+  scale_fill_manual("Indication",
+    values = c("#0C2C84", "#225EA8", "#1D91C0", "#41B6C4",
+               "#E69F00", "#009E73", "#CC79A7")) + 
+  facet_grid(. ~ fu_ae_cat, switch = "x") + 
+  labs(x = "Number of AECOPD during follow-up") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.spacing.x = unit(0.5, "cm"), 
+        legend.title = element_text(face = "bold"))
+
+```
+
+```{r fig-ind-miss, fig.cap="Proportion of antibiotic prescriptions that are missing a recorded indication, grouped by the number of AECOPD during follow-up", fig.width=6.5, fig.height=3, dpi=300}
+
+fig_mis_data <- add_base(abx_cohort, "fu_ae_cat", nomatch = 0) %>% 
+  .[, .(fu_ae_cat, miss = is.na(system))] %>% 
+  .[, .N, by = .(fu_ae_cat, miss)] %>% 
+  .[, .(miss, N, p = N / sum(N)), by = fu_ae_cat] %>% 
+  .[miss == TRUE]
+
+ggplot(fig_mis_data, aes(1, p)) + 
+  geom_col(fill = "darkgrey") + 
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) + 
+  facet_grid(. ~ fu_ae_cat, switch = "x") + 
+  labs(x = "Number of AECOPD during follow-up") + 
+  theme_minimal() + 
+  theme(axis.text.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.spacing.x = unit(0.5, "cm"))
+
+```
+
+
+```{r fig-num-abx}
+
+abx_per_pat <- 
+  baseline[risk == 365, .(patid, fev, mrc, aecopd, fu_ae_cat, num_abx)]
+
+  
+abx_cnt <- c(0, 1, 2, 3, 4, 5, 7, 9, Inf)  
+names(abx_cnt) <- c("0", "1", "2", "3", "4", "5", "6-7", "8-9", "10+")
+abx_per_pat[, num_abx_cat := cut(num_abx, c(-Inf, abx_cnt), names(abx_cnt))]
+
+
+fig_num_abx <- function(group){
+  abx_per_pat[, .(.N), by = c(group, "num_abx_cat")] %>% 
+          .[, .(num_abx_cat, perc_pat = N / sum(N)), by = c(group)] %>%
+          .[!is.na(get(group))] %>% 
+  ggplot(aes(num_abx_cat, perc_pat * 100, fill = num_abx_cat != "0")) + 
+  geom_col() + 
+  scale_y_continuous(limits = c(0, 50)) + 
+  scale_fill_viridis_d(option = "plasma", begin = 0.1, end = 0.8, direction = -1) + 
+  guides(alpha = FALSE, fill = FALSE) + 
+  labs(x = "Number of antibiotic prescriptions", y = "% of patients") + 
+  facet_grid(as.formula(str_c(group, "~ ."))) + 
+  theme_minimal() + 
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.spacing = unit(2, "lines"))
+}
+
+```
+
+
+```{r fig-num-abx-sev, eval = all_tables, warning = FALSE, fig.cap="Distribution of the number of antibiotic prescriptions in 2015 by COPD severity"}
+
+fig_num_abx("fev")
+
+```
+
+```{r fig-num-abx-mrc, eval = all_tables, warning = FALSE, fig.cap="Distribution of the number of antibiotic prescriptions in 2015 by MRC score"}
+
+fig_num_abx("mrc")
+
+```
+
+```{r fig-num-abx-ae, eval = all_tables, warning = FALSE, fig.cap="Distribution of the number of antibiotic prescriptions in 2015 by number of AECOPD during baseline year"}
+
+fig_num_abx("aecopd")
+
+```
+
+```{r fig-num-abx-fu, eval = all_tables, warning = FALSE, fig.cap="Distribution of the number of antibiotic prescriptions in 2015 by number of AECOPD during follow-up"}
+
+fig_num_abx("fu_ae_cat")
+
+```
+
+
+
+```{r fig_cross_tab}
+
+g_cross_tab <- 
+  ggplot(NULL, aes(var1, fct_rev(variable), fill = as.numeric(value))) + 
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", begin = 0.2, end = 0.8, 
+                       limits = c(1, 10), breaks = 1:10) + 
+  labs(fill = "Rate of prescribing") + 
+  coord_fixed() + 
+  theme_minimal() + 
+  theme(legend.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+```
+
+```{r fig-cross-sev-ae, eval = all_tables, warning = FALSE, fig.cap="Rate of antibiotic prescribing in 2015 by COPD severity and number of AECOPD during baseline year"}
+
+g_cross_tab %+%
+  (tbl_cross("fev", "aecopd", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "COPD severity", y = "Number of AECOPD in baseline year") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete(labels = rev(c("0", "1 moderate", "2 moderate", "3+ moderate", "1+ severe")))
+
+```
+
+```{r fig-cross-sev-mrc, eval = all_tables, warning = FALSE, fig.cap="Rate of antibiotic prescribing in 2015 by COPD severity and by MRC score"}
+
+g_cross_tab %+%
+  (tbl_cross("fev", "mrc", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "COPD severity", y = "MRC score") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete()
+
+```
+
+```{r fig-cross-mrc-ae, eval = all_tables, warning = FALSE, fig.cap="Rate of antibiotic prescribing in 2015 by MRC score and by number of AECOPD during baseline year"}
+
+g_cross_tab %+%
+  (tbl_cross("mrc", "aecopd", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "MRC score", y = "Number of AECOPD in baseline year") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete(labels = rev(c("0", "1 moderate", "2 moderate", "3+ moderate", "1+ severe")))
+
+```
+
+
+```{r fig-cross-sev-fu, eval = all_tables, warning = FALSE, fig.cap="Rate of antibiotic prescribing in 2015 by FEV1 and number of AECOPD during follow-up"}
+
+g_cross_tab %+%
+  (tbl_cross("fev", "fu_ae_cat", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "FEV1", y = "Number of AECOPD during follow-up") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete(labels = rev(c("0", "1 moderate", "2 moderate", "3+ moderate", "1+ severe")))
+
+```
+
+```{r fig-cross-mrc-fu, eval = all_tables, warning = FALSE}
+
+g_cross_tab %+%
+  (tbl_cross("mrc", "fu_ae_cat", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "MRC score", y = "Number of AECOPD during follow-up") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete(labels = rev(c("0", "1 moderate", "2 moderate", "3+ moderate", "1+ severe")))
+
+```
+
+```{r fig-cross-ae-fu, eval = all_tables, warning = FALSE, fig.cap="Rate of antibiotic prescribing in 2015 by number of AECOPD during baseline year and follow-up"}
+
+g_cross_tab %+%
+  (tbl_cross("aecopd", "fu_ae_cat", with_ci = FALSE) %>% melt(id.vars = "var1")) +
+  labs(x = "Number of AECOPD in baseline year", y = "Number of AECOPD during follow-up") +
+  scale_x_discrete(position = "top") + 
+  scale_y_discrete()
+
+```
+
+
+
+```{r fig-mosaic}
+
+data_mosaic <- function(rates, cnts){
+  # Bring the data into a format suitable to create a mosaic plot
+  #
+  # Args:
+  #   rates - rates for each combination in long format
+  #   cnts - cnts for each combination in long format
+  #
+  # Result:
+  #   a data.table with the necessary x and y coordinates to create
+  #   a mosaic plot with geom_rect
+  
+  dt <- merge(rates, cnts, by = names(rates)[1:2], sort = FALSE)
+  
+  dt[, n_abx := as.numeric(rate) * cnt] # Number of antibiotics
+  
+  dt[, id_n := sum(n_abx), by = c(names(rates)[2])]
+  dt[, x_end := cumsum(id_n), by = c(names(rates)[1])]
+  dt[, x_start := c(0, x_end[-.N]), by = c(names(rates)[1])]
+  
+  dt[, y_end := .(cumsum(n_abx) / sum(n_abx)), by = c(names(rates)[2])]
+  dt[, y_start := c(0, y_end[-.N]), by = c(names(rates)[2])]
+  
+  dt[]
+}
+
+g_mosaic <- 
+  ggplot(NULL, aes(xmin = x_start, xmax = x_end,
+                    ymin = y_start, ymax = y_end, fill = as.numeric(rate))) + 
+    geom_rect(colour = "white", size = 2) + 
+    scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
+                         limits = c(0, 10), breaks = 0:10) + 
+    labs(fill = "Rate per year") + 
+    theme_minimal() + 
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "bottom", 
+          legend.title = element_text(face = "bold", vjust = 0.85),
+          legend.key.width = unit(2, "cm"))
+
+convert_to_graph <- function(var){
+  # Helper function that uses the tbl_cross function to get all
+  # information needed to graph a mosaic plot
+  
+  sev_rate <- tbl_cross(var, "fu_ae_cat", with_ci = FALSE) %>% 
+    melt(id.vars = "var1", value.name = "rate")
+  sev_cnts <- tbl_cross(var, "fu_ae_cat", method = "count") %>% 
+    melt(id.vars = "var1", value.name = "cnt")
+  
+  data_mosaic(sev_rate, sev_cnts)
+}
+
+```
+
+```{r fig-mosaic-sev-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 1.28 (1.20-1.37) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+d_sev_fu <- convert_to_graph("fev")
+
+g_mosaic %+% d_sev_fu +
+  labs(x = "Number of AECOPD during follow-up\n", y = "FEV1\n") + 
+  scale_x_continuous(breaks = with(d_sev_fu[var1 == "mild"], x_start + x_end) / 2,
+                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     position = "top") + 
+  scale_y_reverse(breaks = with(d_sev_fu[variable == "0"], y_start + y_end) / 2, 
+                  labels = unique(d_sev_fu$var1))
+
+```
+
+```{r fig-mosaic-mrc-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by MRC score), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 1.02 (0.96-1.08) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+d_mrc_fu <- convert_to_graph("mrc")
+
+g_mosaic %+% d_mrc_fu +
+  labs(x = "Number of AECOPD during follow-up\n", y = "MRC score\n") + 
+  scale_x_continuous(breaks = with(d_mrc_fu[var1 == "1"], x_start + x_end) / 2,
+                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     position = "top") + 
+  scale_y_reverse(breaks = with(d_mrc_fu[variable == "0"], y_start + y_end) / 2, 
+                  labels = unique(d_mrc_fu$var1))
+
+```
+
+```{r fig-mosaic-ae-fu, warning = FALSE, message= FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with zero AECOPD during baseline and with zero AECOPD during follow up were prescribed an average of 1.22 (1.18-1.27) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+d_ae_fu <- convert_to_graph("aecopd")
+
+g_mosaic %+% d_ae_fu +
+  labs(x = "Number of AECOPD during follow-up\n", y = "Number of AECOPD during baseline\n") + 
+  scale_x_continuous(breaks = with(d_ae_fu[var1 == "0"], x_start + x_end) / 2,
+                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     position = "top") + 
+  scale_y_reverse(breaks = with(d_ae_fu[variable == "0"], y_start + y_end) / 2, 
+                  labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe")) +
+  scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
+                         limits = c(0, 11), breaks = 0:11)
+
+```
+
+
+```{r matching, fig.cap = "Rate in reference population (for comparison)"}
+
+# Match all possible candidates
+mtchd <- everyone[!baseline, on = "patid"] %>% 
+                .[baseline, on = .(pracid, age, female), .(patid, pracid, age, female, risk, case = i.patid),
+                  allow.cartesian = TRUE, nomatch = 0]
+
+# Combinations are discrete (e.g. age 76, female, practise XY). Shuffle and 
+# sequentially assign a control to one of the patients with the least controls
+mtchd <- mtchd[, .(opts = list(case)), by = .(patid, pracid, age, female, risk)]
+set.seed(5432)
+mtchd %<>% .[sample(1:.N)]
+mtchd[, choice := rep(unlist(opts), ceiling(.N / length(opts[1])))[1:.N], by = .(pracid, age, female)]
+
+# Now randomly keep up to 4 of the controls for each COPD patient
+set.seed(4321)
+mtchd_4 <- mtchd[, .SD[sample(1:.N, size = min(4, .N))], by = choice]
+
+# For each control, calculate the number of antibiotics received
+abx_mtchd <- abx[prescdate %between% list(main_start, study_end), .(num_abx = .N), by = patid]
+mtchd_4[abx_mtchd, on = "patid", num_abx := num_abx]
+mtchd_4[is.na(num_abx), num_abx := 0L]
+
+# Scale age in the same way as the main analysis
+mtchd_4[, age_scaled := scale(age, center = attr(baseline$age_scaled, "scaled:center"), 
+                                   scale = attr(baseline$age_scaled, "scaled:scale"))]
+
+
+# Calculate the rate
+form <- num_abx ~ age_scaled * female + (1 | pracid)
+mod <- glmmTMB(form, family = nbinom2, data = mtchd_4, offset = log(risk))
+
+ref <- exp(summary(mod)$coefficients$cond[1, 1]) * 365
+ref_se <- summary(mod)$coefficients$cond[1, 2]
+ref_ci <- str_c("(", round(ref * exp(qnorm(0.025) * ref_se), 2), "-", 
+                     round(ref * exp(qnorm(0.975) * ref_se), 2), ")")
+
+# Plot for comparison
+g_mosaic %+%
+  aes(xmin = 0, xmax = 1, ymin = 0, ymax = 1, fill = ref) + 
+  geom_text(aes(0.5, 0.5, label = str_c(round(ref, 2), " ", ref_ci)), size = 12, colour = "white") + 
+  labs(x = "", y = "") + 
+  guides(fill = FALSE) + 
+  coord_fixed(expand = FALSE) +
+  theme(axis.text = element_blank(), 
+        axis.ticks = element_blank())
+
+```
+
+
+

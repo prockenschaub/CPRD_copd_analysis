@@ -1,0 +1,647 @@
+---
+title: "Exploration of missing data in COPD cohort"
+output:
+  bookdown::pdf_document2:
+    fig_caption: yes
+    keep_tex: yes
+    toc: no
+  html_document:
+    df_print: paged
+  word_document:
+bibliography: ../99_bibliography/thesis.bib
+csl: ../99_bibliography/bmj.csl
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(root.dir = "..")
+knitr::opts_chunk$set(echo = FALSE)
+
+knitr::opts_knit$set(root.dir = "..")
+
+```
+
+```{r config, include=FALSE}
+
+# Path from project directory to this file
+# NOTE: must be set in each programme separately
+subfolder <- "04_copd"
+
+# Initialise the workspace
+source(file.path(subfolder, "00_init.R"))
+
+# Load additional libraries
+library(glmmTMB)
+library(knitr)
+library(kableExtra)
+library(forcats)
+library(ggplot2)
+library(mice)
+library(broom)
+
+# Fix a bug in the glmmTMB package (until package is updated)
+source("99_fix_glmmTMB_summary.R")
+source("99_glmmTMB_tidiers.R")
+
+# Load tabulation functionality
+source(file.path(subfolder, "00_tabulation.R"))
+
+# Set the output format for kableExtra
+format <- "latex"
+
+# Determine whether full imputaiton should be run or only pattern analysis performed
+run_imputation <- FALSE 
+
+```
+
+```{r load_data}
+char(practices, cohort, patients, comorb, abx, reason, presc_as, obese, smoke, 
+     aecopd, severe_aecopd, fev, mrc, flu_vacc, cons, admission, hosp_diag, ae) %>% 
+  walk(load_derived)
+
+```
+
+```{r load_methods}
+
+# Load all methods used in ....
+# For more information on why certain decisions were made, look there.
+source(file.path(subfolder, "03a_derive_tables.R"))
+
+```
+
+```{r baseline}
+
+# Run chunk baseline defined in load_methods block
+
+```
+
+```{r format_baseline}
+
+# Convert the variables into the right format
+baseline[, female := factor(female, 0:1, c("male", "female"))]
+
+age_lvls <- c("35-50" = 50, "50-60" = 60, "60-70" = 70, "70-80" = 80, ">80" = Inf)
+baseline[, age_cat:= cut(age, c(0, age_lvls), names(age_lvls), right = FALSE)]
+baseline[, age_scaled := scale(age)]
+
+baseline[, imd := factor(imd, 1:5)]
+
+lgl <- char(asthma, chd, ckd, dm, hf, pad, stroke, vacc)
+fill_na(baseline, lgl, FALSE)
+baseline[, (lgl) := map(.SD, factor, c(FALSE, TRUE), c("no", "yes")), .SDcols = lgl]
+
+fill_na(baseline, "obese", "non")
+baseline[, obese := factor(obese, c("non", "obese", "severely obese"))]
+baseline[, obese := fct_recode(obese, obese = "severely obese")]
+baseline[, smoke := factor(smoke, levels = c("ex", "smoke"))]
+baseline[, mrc := factor(mrc, levels = as.character(1:5))]
+
+ae_lvls <- c("0" = 0, "1" = 1, "2" = 2, "3+" = Inf)
+baseline[, aecopd := cut(num_aecopd, c(-Inf, ae_lvls), names(ae_lvls))]
+baseline[, aecopd := fct_expand(aecopd, "severe")]
+baseline[num_sev_ae > 0, aecopd := "severe"]
+
+baseline[, fu_ae_cat := cut(fu_aecopd, c(-Inf, ae_lvls), names(ae_lvls))]
+baseline[, fu_ae_cat := fct_expand(fu_ae_cat, "severe")]
+baseline[fu_sev_ae > 0, fu_ae_cat := "severe"]
+
+```
+
+```{r abx_cohort}
+
+# Run chunk abx_cohort defined in load_methods block
+
+```
+
+```{r add_abx}
+
+sum_abx <- abx_cohort[, .(num_abx = .N, num_ddd = sum(total_ddd)), by = patid]
+
+baseline[sum_abx, on = "patid", c("num_abx", "num_ddd") := .(num_abx, num_ddd)]
+baseline[is.na(num_abx), num_abx := 0]
+baseline[is.na(num_ddd), num_ddd := 0]
+
+```
+
+```{r util}
+
+# Run chunk util defined in load_methods block
+
+```
+
+```{r subtr-days-in-hosp}
+
+baseline[util, on = "patid", risk := risk - day_hosp]
+
+```
+
+```{r time_since_measurement}
+
+latest_record <- function(dt){
+  dt %<>% 
+    .[cohort, on = "patid"] %>%
+    .[eventdate < ymd("2015-01-01"), 
+      .(patid, d = eventdate %--% ymd("2015-01-01"))] %>% 
+    .[, d := time_length(d, u = "years")] %>% 
+    .[, .(min_dist = min(d)), by = patid] %>% 
+    .[(baseline[, "patid"]), on = "patid"] %>% 
+    .[order(min_dist), .(patid, min_dist, p = 1 / .N)] %>% 
+    .[, cum := cumsum(p)]
+}
+
+time_since_measure <- function(dt){
+  # Plot the cumulative proportion of patients that have a measurement in 
+  # `dt` if the window is increased to X years.
+  #
+  # Args:
+  #   dt - data.table containing at least patientid and eventdate
+  #
+  # Result:
+  #   ggplot with the cumulative proportion
+  
+  dt <- copy(dt)
+  dt %<>% latest_record()
+  
+  ggplot(dt[!is.na(min_dist)], aes(x = min_dist, y = cum)) + 
+    geom_step() + 
+    scale_x_continuous(breaks = 0:1000) + 
+    scale_y_continuous(breaks = 0:10 / 10, labels = scales::percent) + 
+    labs(title = "Proportion of patients with a measurement",
+         x = "Years of lookback",
+         y = "Cumulative proportion") + 
+    coord_cartesian(ylim = c(0, 1), expand = FALSE) + 
+    theme_minimal() +
+    theme(panel.grid.minor.x = element_blank())
+}
+
+```
+
+```{r fev-cutoff, width = 6.5, height = 3, dpi=300}
+
+time_since_measure(fev) + 
+  geom_vline(xintercept = 1, alpha = 0.7) + # 
+  geom_hline(yintercept = nrow(baseline[!is.na(fev)]) / nrow(baseline), colour = "darkblue", size = 1) + 
+  labs(title = "Proportion of patients with FEV1 measurement as a function of lookback period")
+
+```
+
+```{r mrc-cutoff, width = 6.5, height = 3, dpi=300}
+
+time_since_measure(mrc) + 
+  geom_vline(xintercept = 1, alpha = 0.7) + 
+  geom_hline(yintercept = nrow(baseline[!is.na(mrc)]) / nrow(baseline), colour = "darkblue") + 
+  labs(title = "Proportion of patients with MRC score as a function of lookback period")
+
+```
+
+```{r fev-mrc-cutoff, width = 6.5, height = 3, dpi=300}
+
+time_since_measure(rbind(fev[, .(patid, eventdate)], mrc[, .(patid, eventdate)])) + 
+  geom_vline(xintercept = 1, alpha = 0.7) + 
+  labs(title = "Proportion of patients with FEV1 or MRC score as a function of lookback period")
+
+```
+
+
+```{r miss-measures, include = FALSE}
+
+m12_24 <- list(main_start %m-% months(24), main_start %m-% months(12) %m-% days(1))
+m24_36 <- list(main_start %m-% months(36), main_start %m-% months(24) %m-% days(1))
+m36_48 <- list(main_start %m-% months(48), main_start %m-% months(36) %m-% days(1))
+
+# Get FEV1 at past cut-offs
+fev_12 <- closest_in(fev[, !("method")], m12_24)
+fev_24 <- closest_in(fev[, !("method")], m24_36)
+fev_36 <- closest_in(fev[, !("method")], m36_48)
+
+# Get MRC scale at past cut-offs
+mrc_12 <- closest_in(mrc[, !("medcode")], m12_24)
+mrc_24 <- closest_in(mrc[, !("medcode")], m24_36)
+mrc_36 <- closest_in(mrc[, !("medcode")], m36_48)
+
+miss <- 
+  mget(c(ls(pattern = "fev_[^l]"), ls(pattern = "mrc_[^l]"))) %>% 
+  map2(., names(.), ~ setnames(.x, c("patid", .y))) %>% 
+  reduce(merge, by = "patid", all = TRUE)
+
+miss %<>% .[(baseline[, "patid"]), on = "patid"]
+
+setcolorder(miss, char(patid, fev_36, fev_24, fev_12, fev_at_base,
+                              mrc_36, mrc_24, mrc_12, mrc_at_base))
+
+```
+
+```{r corr-subsequent, width = 6.5, height = 4, dpi=300}
+
+# Calculate the correlation between following measurements
+cor_fev_12 <- fev_at_base[fev_12, on = "patid", nomatch = 0][, cor(fev_at_base, fev_12)]
+cor_fev_24 <- fev_at_base[fev_24, on = "patid", nomatch = 0][, cor(fev_at_base, fev_24)]
+cor_fev_36 <- fev_at_base[fev_36, on = "patid", nomatch = 0][, cor(fev_at_base, fev_36)]
+
+cor_mrc_12 <- mrc_at_base[mrc_12, on = "patid", nomatch = 0][, map(.SD, as.numeric)][, cor(mrc_at_base, mrc_12, method = "spearman")]
+cor_mrc_24 <- mrc_at_base[mrc_24, on = "patid", nomatch = 0][, map(.SD, as.numeric)][, cor(mrc_at_base, mrc_24, method = "spearman")]
+cor_mrc_36 <- mrc_at_base[mrc_36, on = "patid", nomatch = 0][, map(.SD, as.numeric)][, cor(mrc_at_base, mrc_36, method = "spearman")]
+
+
+data.table(var = rep(c("FEV1", "MRC"), each = 3),
+           mon = rep(1:3 * 12, times = 2),
+           cor = unlist(mget(x = ls(pattern = "cor_")))) %>% 
+  ggplot(aes(mon, cor)) + 
+  geom_col() + 
+  scale_x_continuous(breaks = 1:3 * 12, labels = c("12-24", "24-36", "36-48")) + 
+  scale_y_continuous(limits = c(0, 1)) + 
+  facet_grid(. ~ var) + 
+  labs(x = "Measurement at X months", y = "Correlation with baseline measurement") + 
+  theme_minimal() + 
+  theme(panel.grid.minor.x = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+```
+
+
+```{r}
+
+miss[, mean(!is.na(fev_at_base))]
+miss[, mean(!is.na(fev_12))]
+miss[, mean(!is.na(fev_24))]
+miss[, mean(!is.na(fev_36))]
+
+
+miss[, mean(!is.na(mrc_at_base))]
+miss[, mean(!is.na(mrc_12))]
+miss[, mean(!is.na(mrc_24))]
+miss[, mean(!is.na(mrc_36))]
+
+# Cumulative
+p_fev <- latest_record(fev)
+
+p_fev[min_dist <= 2, max(cum)]
+p_fev[min_dist <= 3, max(cum)]
+p_fev[min_dist <= 4, max(cum)]
+
+p_mrc <- latest_record(mrc)
+
+p_mrc[min_dist <= 2, max(cum)]
+p_mrc[min_dist <= 3, max(cum)]
+p_mrc[min_dist <= 4, max(cum)]
+
+
+p_both <- latest_record(rbind(fev[, .(patid, eventdate)], mrc[, .(patid, eventdate)]))
+
+p_both[min_dist <= 1, max(cum)]
+p_both[min_dist <= 2, max(cum)]
+p_both[min_dist <= 3, max(cum)]
+p_both[min_dist <= 4, max(cum)]
+
+```
+
+```{r miss-pattern}
+
+plus <- if_else(format == "html", "\\+", "+")
+minus <- if_else(format == "html", "--", "-")
+
+miss_pattern <- 
+  miss[, map(.SD, is.na)] %>% 
+     .[, .N, by = c(names(miss)[-1])] %>% 
+     .[, N_miss := rowSums(.SD[, !("N")])] %>% 
+     .[, perc_pat := `%`(N, sum(N))] %>% 
+     .[order(-N)] %>% 
+     .[, N := prty(N)] %>% 
+     .[, map(.SD, ~ (if(is.logical(.)) factor(., c(FALSE, TRUE), c(plus, minus)) else .))] %>% 
+     .[1:20]
+
+header <- c(4, 4, 2)
+names(header) <- c(lb("FEV1 available at\\\\nX months before index", format), 
+                   lb("MRC score available at\\\\nX months before index", format),
+                   " ")
+
+miss_pattern[, !("N_miss")] %>%
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c(rep("c", 8), "r", "r"),
+    escape = TRUE,
+    col.names = c(rep(c("36-48", "24-36", "12-24", "0-12"), 2L), "No. patients", "% of patients"),
+    caption = if(format == "html") "Patterns of missingness in FEV1 and MRC" else "(ref:cap-tab-pattern)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(header, escape = FALSE)
+
+```
+
+```{r miss_shape, width = 6.5, height = 3, dpi=300}
+
+# Look for normality in FEV1
+ggplot(baseline[!is.na(fev)], aes(x = fev)) + 
+  geom_density() + 
+  theme_minimal() + 
+  stat_function(fun = dnorm, colour = "darkblue", alpha = 0.5,
+                args = list(mean = mean(baseline$fev, na.rm = TRUE), 
+                            sd = sd(baseline$fev, na.rm = TRUE))) + 
+  labs(title = "Distribution of observed FEV1 at baseline (blue - normal reference distribution")
+
+
+# Look for the shape of MRC
+ggplot(baseline[!is.na(mrc)], aes(x = mrc)) + 
+  geom_bar() + 
+  theme_minimal() + 
+  labs(title = "Distribution of observed MRC scores")
+
+```
+
+```{r assoc_outcome}
+
+# Association between outcome and complete cases
+miss_fev <- glm(is.na(fev) ~ num_abx, data = baseline, family = binomial(link = "logit")) # FEV1 only
+miss_mrc <- glm(is.na(mrc) ~ num_abx, data = baseline, family = binomial(link = "logit")) # MRC only
+miss_comp <- glm(is.na(fev) | is.na(mrc) | is.na(smoke) ~ num_abx,    # FEV1, MRC and smoke
+                        data = baseline, family = binomial(link = "logit"))
+
+ratio_CI <- function(log_mod, var = ".*"){
+  # Extract the OR, confidence intervals and p-values from a logistic regression model
+  
+  coefs <- tidy(log_mod) %>% as.data.table()
+  
+  coefs[, est := exp(estimate)]
+  coefs[, c("lower", "upper") := norm_ci(estimate, std.error)]
+  coefs[, p.value := if_else(p.value < 0.001, "<0.0001", prty(p.value, 3))]
+  
+  if(nrow(coefs) > 2){
+    coefs[1, (names(coefs)) := .("ref", 1, NA, NA, "")] 
+  } else {
+    coefs %<>% .[-1]
+  }
+  
+  coefs[, .(term, est, lower, upper, p.value)]
+}
+
+assoc_outcome <-  rbind(ratio_CI(miss_fev), ratio_CI(miss_mrc), ratio_CI(miss_comp))
+
+setDT(assoc_outcome)
+
+assoc_outcome[, term := c("FEV1", "MRC score", "FEV1 + MRC")]
+assoc_outcome %<>% .[, map(.SD, ~ (if(is.numeric(.)) prty(., 2) else .))]
+
+assoc_outcome[, .(term, est, str_c(lower,  upper, sep = ", "), p.value)] %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", "r", "r", "c"),
+    col.names = c("Missing", "OR", "95%-CI", "p-value"),
+    caption = if(format == "html") "Association of outcome and missingness" else "(ref:cap-tab-assoc-outcome)"
+  ) %>% 
+  kable_styling()
+
+
+```
+
+
+```{r prob_missing}
+
+prob_missing <- function(dt, var){
+  
+  all <- dt[[var]]
+  
+  scaled <- 
+    case_when(is.numeric(all)         ~ list(as.numeric(all), 
+                                             scale(as.numeric(all))),
+              length(levels(all)) > 2 ~ list(as.numeric(all), 
+                                             scale(as.numeric(all), scale = FALSE)),
+              TRUE                    ~ list((as.numeric(all) - 1) * 100, 
+                                             as.numeric(all) - 1))
+  
+  all_cnt <- data.table(all = prty(sum(!is.na(all))), 
+                        all_perc = `%`(sum(!is.na(all)), length(all), 0), 
+                        all_mean = prty(mean(scaled[[1]], na.rm = TRUE), 1))  
+  
+  sub <- baseline[, which(!is.na(fev) & !is.na(mrc) & !is.na(smoke))]
+  
+  sub_cnt <- data.table(sub = prty(sum(!is.na(all[sub]))), 
+                        sub_mean = prty(mean(scaled[[1]][sub], na.rm = TRUE), 1))  
+  
+  
+  form <- function(depend){
+    
+    as.formula(str_c("is.na(", depend, ") ~ scaled[[2]]"))
+  }
+  
+  OR_format <- function(log_mod){
+    summ <- ratio_CI(log_mod)
+    summ %<>% .[, map(.SD, ~ (if(is.numeric(.)) prty(., 2) else .))]
+    summ[, ci := str_c(lower, upper, sep = ", ")]
+    summ[, c("term", "lower", "upper", "p.value") := NULL]
+    summ[]
+  }
+  
+  or_fev_miss <- glm(form("fev"), data = dt, family = binomial(link = "logit"))
+  or_mrc_miss <- glm(form("mrc"), data = dt, family = binomial(link = "logit"))
+  
+  cbind(data.table(name = var), all_cnt, sub_cnt, 
+        OR_format(or_fev_miss), OR_format(or_mrc_miss))
+}
+
+
+
+hdr <- c(1, 3, 2, 2, 2)
+names(hdr) <- c(" ", "Whole dataset", "Complete observations", 
+                lb("FEV1 at\\\\nbaseline", format), 
+                lb("MRC at\\\\nbaseline", format))
+                #, "Smoking status")
+
+mrc_cols <- names(miss)[names(miss) %like% "mrc"]
+miss[, (mrc_cols) := map(.SD, factor, levels = str_c(1:5)), .SDcols = mrc_cols] 
+
+
+rbind(
+  # Outcome
+  prob_missing(baseline, "num_abx"),
+  
+  # Missing variables
+  suppressWarnings(prob_missing(baseline, "fev")[, (7:8) := ""][]),
+  suppressWarnings(prob_missing(baseline, "mrc")[, (9:10) := ""][]),
+  suppressWarnings(prob_missing(baseline, "aecopd")),
+  
+  # Past observations
+  char(fev_36, fev_24, fev_12, mrc_36, mrc_24, mrc_12) %>% 
+    map(prob_missing, dt = miss[baseline, on = "patid"]) %>% rbindlist(),
+  
+  # Other variables
+  char(age, female, imd, asthma, chd, ckd, dm, hf, pad, stroke, obese, smoke) %>% 
+    map(prob_missing, dt = baseline) %>% rbindlist()
+) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5), rep(c("r", "l"), 2)),
+    escape = FALSE, 
+    col.names = c("", lb("No. with\\\\nmeasurement", format), lb("\\% with\\\\nmeasurement", format), "Mean value", 
+                  lb("No. with\\\\nmeasurement", format), "Mean value",
+                  rep(c("OR", "95\\%-CI"), 2)),
+    caption = if(format == "html") "Association of variables and missingness" else "(ref:cap-tab-prob-miss)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(hdr, escape = FALSE) %>% 
+  add_header_above(c(" " = 6, "Odds of missingness in variable" = 4)) %>% 
+  group_rows("Main variables", 1, 4) %>% 
+  group_rows("Past observations", 5, 10) %>% 
+  group_rows("Other variables", 11, 22)
+
+
+```
+
+
+```{r assoc_explain}
+
+assoc_explain <- function(dt, var){
+  
+  all <- dt[[var]]
+  
+  scaled <- 
+    case_when(is.numeric(all)         ~ list(as.numeric(all), 
+                                             scale(as.numeric(all))),
+              length(levels(all)) > 2 ~ list(as.numeric(all), 
+                                             scale(as.numeric(all), scale = FALSE)),
+              TRUE                    ~ list((as.numeric(all) - 1) * 100, 
+                                             as.numeric(all) - 1))
+  
+  all_cnt <- data.table(all = prty(sum(!is.na(all))), 
+                        all_perc = `%`(sum(!is.na(all)), length(all), 0), 
+                        all_mean = prty(mean(scaled[[1]], na.rm = TRUE), 1))  
+  
+  sub <- baseline[, which(!is.na(fev) & !is.na(mrc) & !is.na(smoke))]
+  
+  sub_cnt <- data.table(sub = prty(sum(!is.na(all[sub]))), 
+                        sub_mean = prty(mean(scaled[[1]][sub], na.rm = TRUE), 1))  
+  
+  RR_format <- function(log_mod){
+    summ <- ratio_CI(log_mod)
+    summ %<>% .[, map(.SD, ~ (if(is.numeric(.)) prty(., 2) else .))]
+    summ[, ci := str_c(lower, upper, sep = ", ")]
+    summ[, c("term", "lower", "upper", "p.value") := NULL]
+    summ[]
+  }
+  
+  dt$scaled <-scaled[[2]]
+  rr_abx <- glm(num_abx ~ scaled, data = dt, family = poisson(link = "log"))
+  
+  cbind(data.table(name = var), all_cnt, sub_cnt, RR_format(rr_abx))
+}
+
+
+hdr <- c(1, 3, 2, 2)
+names(hdr) <- c(" ", "Whole dataset", "Complete observations", 
+                lb("Number of antibiotics", format))
+
+rbind(
+  # Missing variables
+  suppressWarnings(assoc_explain(baseline, "fev")[]),
+  suppressWarnings(assoc_explain(baseline, "mrc")[]),
+  suppressWarnings(assoc_explain(baseline, "aecopd")[]),
+  
+  # Past observations
+  char(fev_36, fev_24, fev_12, mrc_36, mrc_24, mrc_12) %>% 
+    map(assoc_explain, dt = miss[baseline, on = "patid"]) %>% rbindlist(),
+  
+  # Other variables
+  char(age, female, imd, asthma, chd, ckd, dm, hf, pad, stroke, obese, smoke) %>% 
+    map(assoc_explain, dt = baseline) %>% rbindlist()
+) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5), "r", "l"),
+    escape = FALSE, 
+    col.names = c("", lb("No. with\\\\nmeasurement", format), lb("\\% with\\\\nmeasurement", format), "Mean value", 
+                  lb("No. with\\\\nmeasurement", format), "Mean value", "RR", "95\\%-CI"),
+    caption = if(format == "html") "Association of explanatory variables and antibiotic prescribing" else "(ref:cap-tab-assoc-expl)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(hdr, escape = FALSE) %>% 
+  group_rows("Main variables", 1, 3) %>% 
+  group_rows("Past observations", 4, 9) %>% 
+  group_rows("Other variables", 10, 21)
+
+
+```
+
+
+```{r impute-non-hierarchical, eval=run_imputation}
+
+# Combine previous measures with baseline variables
+impute_dt <- miss[baseline, on = "patid"]
+
+
+impute_dt %<>% .[, .(patid, pracid, 
+                     fev_36, fev_24, fev_12, fev_0 = fev, fev = NA, 
+                     mrc_36, mrc_24, mrc_12, mrc_0 = mrc, mrc = NA,
+                     female, age_scaled, imd, asthma, chd, ckd, dm, hf, pad, stroke, obese, smoke, vacc,
+                     aecopd, fu_ae_cat, num_abx, risk = risk / 365)]
+
+# Make MRC into an ordered variable
+impute_dt[, mrc_0 := factor(mrc_0, str_c(1:5), ordered = TRUE)]
+impute_dt[, (mrc_cols[-4]) := map(.SD, as.ordered), .SDcols = (mrc_cols[-4])]
+
+# Set up the imputation model
+ini <- mice(impute_dt, maxit = 0, print = FALSE)
+
+# Define imputation method for FEV and MRC (MRC is by dfault polyr)
+meth <- ini$method
+meth[names(meth) %like% "fev"] <- "norm"
+  
+# Exclude patid and pracid from the predictors
+pred <- ini$predictorMatrix
+pred[, c("patid", "pracid")] <- 0
+
+# Keep FEV1 in the allowable range
+post <- ini$post
+post[names(post) %like% "fev"] <- "imp[[j]][, i] <- squeeze(imp[[j]][, i], c(5, 100))"
+
+imp <- mice(impute_dt, m = 5, meth = meth, pred = pred, post = post, seed = 5243)
+
+plot(imp)
+
+imp40 <- mice.mids(imp, maxit = 35)
+
+plot(imp40)
+
+saveRDS(imp40, file = "04_copd/02_imputed/non_hierarchical_imputation.rds")
+
+```
+
+
+```{r impute-hierarchical, eval=run_imputation}
+
+ini <- mice(impute_dt, maxit = 0, print = FALSE)
+
+meth <- ini$method
+meth[names(meth) %like% "fev"] <- "2l.norm"
+
+pred <- ini$predictorMatrix
+pred[, c("patid", "pracid")] <- 0
+pred[row.names(pred) %like% "fev",] <- pred[row.names(pred) %like% "fev",] * 2 # Indicate as random effect
+pred[row.names(pred) %like% "fev", "pracid"] <- -2 # Set as group
+
+post <- ini$post
+post[names(post) %like% "fev"] <- "imp[[j]][, i] <- squeeze(imp[[j]][, i], c(5, 100))"
+
+imp_h <- mice(impute_dt, m = 20, meth = meth, pred = pred, post = post, seed = 5243)
+
+plot(imp_h)
+
+imp_h40 <- mice.mids(imp_h, maxit = 35)
+
+plot(imp_h40)
+
+saveRDS(imp_h40, file = "04_copd/02_imputed/hierarchical_imputation.rds")
+
+
+```
+
+

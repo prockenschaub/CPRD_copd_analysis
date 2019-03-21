@@ -1,0 +1,460 @@
+---
+title: "Exploration of missing data in COPD cohort"
+output:
+  bookdown::pdf_document2:
+    fig_caption: yes
+    keep_tex: yes
+    toc: no
+  html_document:
+    df_print: paged
+  word_document:
+bibliography: ../99_bibliography/thesis.bib
+csl: ../99_bibliography/bmj.csl
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(root.dir = "..")
+knitr::opts_chunk$set(echo = FALSE)
+
+knitr::opts_knit$set(root.dir = "..")
+
+```
+
+```{r config, include=FALSE}
+
+# Path from project directory to this file
+# NOTE: must be set in each programme separately
+subfolder <- "04_copd"
+
+# Initialise the workspace
+source(file.path(subfolder, "00_init.R"))
+
+# Load additional libraries
+library(glmmTMB)
+library(knitr)
+library(kableExtra)
+library(forcats)
+library(ggplot2)
+library(mice)
+library(broom)
+
+# Fix a bug in the glmmTMB package (until package is updated)
+source("99_fix_glmmTMB_summary.R")
+source("99_glmmTMB_tidiers.R")
+
+# Load tabulation functionality
+source(file.path(subfolder, "00_tabulation.R"))
+
+# Set the output format for kableExtra
+format <- "latex"
+
+```
+
+```{r load_data}
+char(practices, cohort, patients, comorb, abx, reason, presc_as, obese, smoke, 
+     aecopd, severe_aecopd, fev, mrc, flu_vacc, cons, admission, hosp_diag, ae) %>% 
+  walk(load_derived)
+
+```
+
+```{r load_methods}
+
+# Load all methods used in ....
+# For more information on why certain decisions were made, look there.
+source(file.path(subfolder, "03a_derive_tables.R"))
+
+```
+
+```{r format_baseline}
+
+# Convert the variables into the right format
+baseline[, female := factor(female, 0:1, c("male", "female"))]
+
+age_lvls <- c("35-50" = 50, "50-60" = 60, "60-70" = 70, "70-80" = 80, ">80" = Inf)
+baseline[, age_cat:= cut(age, c(0, age_lvls), names(age_lvls), right = FALSE)]
+baseline[, age_scaled := scale(age)]
+
+baseline[, imd := factor(imd, 1:5)]
+
+lgl <- char(asthma, chd, ckd, dm, hf, pad, stroke, vacc)
+fill_na(baseline, lgl, FALSE)
+baseline[, (lgl) := map(.SD, factor, c(FALSE, TRUE), c("no", "yes")), .SDcols = lgl]
+
+fill_na(baseline, "obese", "non")
+baseline[, obese := factor(obese, c("non", "obese"))]
+baseline[, smoke := factor(smoke, levels = c("ex", "smoke"))]
+baseline[, mrc := factor(mrc, levels = as.character(1:5))]
+
+ae_lvls <- c("0" = 0, "1" = 1, "2" = 2, "3+" = Inf)
+baseline[, aecopd := cut(num_aecopd, c(-Inf, ae_lvls), names(ae_lvls))]
+baseline[, aecopd := fct_expand(aecopd, "severe")]
+baseline[num_sev_ae > 0, aecopd := "severe"]
+
+baseline[, fu_ae_cat := cut(fu_aecopd, c(-Inf, ae_lvls), names(ae_lvls))]
+baseline[, fu_ae_cat := fct_expand(fu_ae_cat, "severe")]
+baseline[fu_sev_ae > 0, fu_ae_cat := "severe"]
+
+```
+
+```{r add_abx}
+
+sum_abx <- abx_cohort[, .(num_abx = .N, num_ddd = sum(total_ddd)), by = patid]
+
+baseline[sum_abx, on = "patid", c("num_abx", "num_ddd") := .(num_abx, num_ddd)]
+baseline[is.na(num_abx), num_abx := 0]
+baseline[is.na(num_ddd), num_ddd := 0]
+
+```
+
+```{r subtr-days-in-hosp}
+
+baseline[util, on = "patid", risk := risk - day_hosp]
+
+```
+
+```{r load-imputations}
+
+imp_h <- read_rds(file.path(subfolder, "02_imputed", "hierarchical_imputation.rds"))
+
+```
+
+```{r rubins-rules}
+
+pool <- function(object, component = "cond"){
+  # Pools estimates of a glmmTMB model run with multiple imputation. 
+  # Code directly adapted from mice:::pool.fitlist
+  #
+  # Args:
+  #   object - a fit glmmTMB model
+  #   component - conditional (cond) or zero-inflated (zi) model part
+  #
+  # Results:
+  #   a data.table with the effect estimates and MI metrics
+  
+  call <- match.call()
+  m <- length(object$analyses)
+  w <- map_df(getfit(object), tidy, component = component)
+
+  dfcom <- summary(getfit(object)[[1]])$AICtab[["df.resid"]]
+  
+  pooled <- 
+    w %>% 
+    mutate(param = rep_len(1L:length(unique(term)), 
+           length.out = n())) %>% 
+    group_by(param) %>% 
+    summarize(
+          m = n(), 
+          term = .data$term[1L], 
+          qbar = mean(.data$estimate), 
+          ubar = mean(.data$std.error^2), 
+          b = var(.data$estimate), 
+          t = ubar + (1 + 1/m) * b, 
+          dfcom = dfcom, 
+          df = mice:::barnard.rubin(m, b, t, dfcom), 
+          riv = (1 + 1/m) * b/ubar, 
+          lambda = (1 + 1/m) * b/t, 
+          fmi = (riv + 2/(df + 3))/(riv + 1)) %>% 
+    select(-m, -param) %>% 
+    as.data.table()
+  
+  pooled <- data.frame(pooled[, -1L], row.names = pooled$term)
+  pooled <- pooled[!is.na(pooled$df),] # Do not pool the random effects
+  names(pooled)[1L] <- "estimate"
+  
+  rr <- list(call = call, m = m, pooled = pooled)
+  class(rr) <- c("mipo", "data.frame")
+  rr
+}
+
+pool_pred <- function(object, newdata){
+  # Pools predictions of a glmmTMB model run with multiple imputation. 
+  # Code directly adapted from Miles A (2015)
+  #
+  # Args:
+  #   object - a fit glmmTMB model
+  #   newdata - a dataset with the observation for whom to predict
+  #
+  # Results:
+  #   a data.table with the predictions and variances
+  
+  p <- map(object$analyses, predict, newdata = newdata, 
+           type = "link", se.fit = TRUE)
+  
+  p %>% 
+    map_df(as_tibble, .id = "it") %>% 
+    mutate(param = rep_len(1L:(n() / length(unique(it))), 
+                           length.out = n())) %>% 
+    group_by(param) %>% 
+    summarise(
+      m = n(),
+      fit_hat = mean(fit),
+      var_wit = mean(se.fit ** 2),
+      var_bet = var(fit),
+      var_tot = var_wit + var_bet * (1 + 1 / m)
+    )
+}
+
+
+```
+
+
+```{r categorise-fev}
+
+fev_lvls <- c("very severe" = 30, "severe" = 50, "moderate" = 80, "mild" = Inf)
+baseline[, fev := cut(fev, c(-Inf, fev_lvls), names(fev_lvls))]
+baseline[, fev := factor(fev, levels = rev(sort(unique(fev))))]
+
+```
+
+```{r model-hier-data}
+
+# Re-format FEV1 and MRC
+long <- complete(imp_h, action = "long", include = TRUE)
+
+long$fev <- cut(long$fev_0, c(-Inf, fev_lvls), names(fev_lvls))
+long$fev <- factor(long$fev, levels = rev(names(fev_lvls)))
+
+long$mrc <- factor(long$mrc_0, ordered = FALSE)
+
+mod_data <- as.mids(long)
+
+mod_data %<>% cbind(fu_ae_cat = baseline$fu_ae_cat) # Remove on next run
+
+```
+
+```{r cats-of-interest}
+
+ref <- function(var){
+  # Create a reference dataset with all combinations of 
+  # 'var' and fu_ae_cat for prediction.
+  # 
+  # Args:
+  #   var - name of var as character
+  #
+  # Result:
+  #   data.table with all combintations of var and fu_ae_cat
+  
+  dt <- unique(baseline[, c(var, "fu_ae_cat"), with = FALSE])
+  dt[, c("age_scaled", "pracid", "risk") := .(0, NA_integer_, 1)]
+  dt[, female := factor(0, c(0, 1), c("male", "female"))]
+  dt <- dt[!is.na(get(var)) & !is.na(fu_ae_cat)]
+  
+  setorderv(dt, c(var, "fu_ae_cat"))
+  
+  dt[]
+}
+
+```
+
+
+```{r data-mosaic}
+
+data_mosaic <- function(rates, cnts){
+  # Bring the data into a format suitable to create a mosaic plot
+  #
+  # Args:
+  #   rates - rates for each combination in long format
+  #   cnts - cnts for each combination in long format
+  #
+  # Result:
+  #   a data.table with the necessary x and y coordinates to create
+  #   a mosaic plot with geom_rect
+  
+  dt <- merge(rates, cnts, by = names(rates)[1:2], sort = FALSE)
+  
+  dt[, n_abx := as.numeric(rate) * cnt] # Number of antibiotics
+  
+  dt[, id_n := sum(n_abx), by = c(names(rates)[2])]
+  dt[, x_end := cumsum(id_n), by = c(names(rates)[1])]
+  dt[, x_start := c(0, x_end[-.N]), by = c(names(rates)[1])]
+  
+  dt[, y_end := .(cumsum(n_abx) / sum(n_abx)), by = c(names(rates)[2])]
+  dt[, y_start := c(0, y_end[-.N]), by = c(names(rates)[2])]
+  
+  dt[]
+}
+
+```
+
+```{r graph-mosaic}
+
+g_mosaic <- 
+  ggplot(NULL, aes(xmin = x_start, xmax = x_end,
+                    ymin = y_start, ymax = y_end, fill = as.numeric(rate))) + 
+    geom_rect(colour = "white", size = 2) + 
+    scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
+                         limits = c(0, 10), breaks = 0:10) + 
+    labs(fill = "Rate per year") + 
+    theme_minimal() + 
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "bottom", 
+          legend.box.margin = margin(l = 0, t = 0, r = 0.75, b = 0, unit = "cm"),
+          legend.title = element_text(face = "bold", vjust = 0.85),
+          legend.key.width = unit(2, "cm"))
+
+```
+
+
+```{r model-hier-fev}
+
+# Run the model
+form <- num_abx ~ fev * fu_ae_cat + age_scaled * female + (1 | pracid)
+fev_imph <- with(mod_data, glmmTMB(form, family = nbinom2, offset = log(risk * 365)))
+
+# Get predictions for rates in each MRC category
+p_fev <- pool_pred(fev_imph, ref("fev"))
+
+rates_fev <- ref("fev")[, .(fev, fu_ae_cat, 
+                    rate = exp(p_fev$fit_hat), 
+                    se_rate = sqrt(p_fev$var_tot))]
+setorder(rates_fev, fev, fu_ae_cat)
+
+# Get average counts of patients in each category
+cnt_fev <- complete(mod_data, "all") %>% 
+  map(setDT) %>% 
+  map_df(~ .[, .(cnt = .N), by = .(fev, fu_ae_cat)])
+
+# Average over imputations (no confidence intervals here)
+cnt_fev %<>% .[, .(cnt = mean(cnt)), by = .(fev, fu_ae_cat)]
+
+setorder(cnt_fev, fev, fu_ae_cat)
+
+# Table rates
+rates_fev[, lower := rate * exp(qnorm(0.025) * se_rate)]
+rates_fev[, upper := rate * exp(qnorm(0.975) * se_rate)]
+rates_fev[, est := str_c(prty(rate, 2), " (", prty(lower, 2), ",", prty(upper, 2), ")")]
+
+dcast(rates_fev, fev ~ fu_ae_cat, value.var = "est") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV", rep("95\\%-CI", 5)),
+    caption = if(format == "html") "Patterns of prescribing" else "(ref:cap-tab-fev-rates)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+
+# Table counts
+dcast(cnt_fev[, .(fev, fu_ae_cat, cnt = round(cnt))], fev ~ fu_ae_cat, value.var = "cnt") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("FEV", rep("N", 5)),
+    caption = if(format == "html") "Imputed FEV counts" else "(ref:cap-tab-fev-cnt)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE)
+
+```
+
+
+```{r fev-hier-mosaic, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with mild COPD with zero AECOPD during follow up were prescribed an average of 1.20 (1.11-1.31) antibiotics per year and accounted for 5.6% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+# Plot
+d_fev_fu <- data_mosaic(rates_fev, cnt_fev)
+
+g_mosaic %+% d_fev_fu + 
+  labs(x = "Number of AECOPD during follow-up\n", y = "FEV1\n") + 
+  scale_x_continuous(breaks = with(d_fev_fu[fev == "mild"], x_start + x_end) / 2,
+                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     position = "top") + 
+  scale_y_reverse(breaks = with(d_fev_fu[fu_ae_cat == "0"], y_start + y_end) / 2, 
+                  labels = unique(d_fev_fu$fev))
+
+
+```
+
+
+```{r model-hier-mrc}
+
+# Run the model
+form <- num_abx ~ mrc * fu_ae_cat + age_scaled * female + (1 | pracid)
+mrc_imph <- with(mod_data, glmmTMB(form, family = nbinom2, offset = log(risk * 365)))
+
+# Get predictions for rates in each MRC category
+p_mrc <- pool_pred(mrc_imph, ref("mrc"))
+
+rates_mrc <- ref("mrc")[, .(mrc, fu_ae_cat, 
+                    rate = exp(p_mrc$fit_hat), 
+                    se_rate = sqrt(p_mrc$var_tot))]
+setorder(rates_mrc, mrc, fu_ae_cat)
+
+# Get average counts of patients in each category
+cnt_mrc <- complete(mod_data, "all") %>% 
+  map(setDT) %>% 
+  map_df(~ .[, .(cnt = .N), by = .(mrc, fu_ae_cat)])
+
+# Average over imputations (no confidence intervals here)
+cnt_mrc %<>% .[, .(cnt = mean(cnt)), by = .(mrc, fu_ae_cat)]
+
+setorder(cnt_mrc, mrc, fu_ae_cat)
+
+# Table rates
+rates_mrc[, lower := rate * exp(qnorm(0.025) * se_rate)]
+rates_mrc[, upper := rate * exp(qnorm(0.975) * se_rate)]
+rates_mrc[, est := str_c(prty(rate, 2), " (", prty(lower, 2), ",", prty(upper, 2), ")")]
+
+dcast(rates_mrc, mrc ~ fu_ae_cat, value.var = "est") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC", rep("Rate (95\\%-CI)", 5)),
+    caption = if(format == "html") "Imputed MRC rates" else "(ref:cap-tab-mrc-rate)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE) %>% 
+  add_header_above(c(" " = 1, "Number of AECOPD during follow-up" = 5), escape = FALSE) %>% 
+  landscape()
+
+# Table counts
+dcast(cnt_mrc[, .(mrc, fu_ae_cat, cnt = round(cnt))], mrc ~ fu_ae_cat, value.var = "cnt") %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 5)),
+    escape = FALSE,
+    col.names = c("MRC", rep("N", 5)),
+    caption = if(format == "html") "Imputed MRC counts" else "(ref:cap-tab-mrc-cnt)"
+  ) %>% 
+  kable_styling() %>% 
+  add_header_above(c(" " = 1, "0" = 1, "1 moderate" = 1, "2 moderate" = 1, 
+                     "3+ moderate" = 1, "1+ severe" = 1), escape = FALSE)
+```
+
+```{r mrc-hier-mosaic, fig.cap="Relationship between disease severity (assessed by MRC score), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 0.97 (0.90-1.05) antibiotics per year and accounted for 4.6% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+# Plot
+d_mrc_fu <- data_mosaic(rates_mrc, cnt_mrc)
+
+g_mosaic %+% d_mrc_fu + 
+  labs(x = "Number of AECOPD during follow-up\n", y = "MRC\n") + 
+  scale_x_continuous(breaks = with(d_mrc_fu[mrc == "1"], x_start + x_end) / 2,
+                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     position = "top") + 
+  scale_y_reverse(breaks = with(d_mrc_fu[fu_ae_cat == "0"], y_start + y_end) / 2, 
+                  labels = unique(d_mrc_fu$mrc))
+
+```
+
+
+
