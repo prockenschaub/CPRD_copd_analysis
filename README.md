@@ -10,3 +10,5 @@ Files prefixed by 99_ provide fixes to R packages that should be fixed in future
 
 All other files should be run in the order that they are indexed to provide the study results. Additional folders to hold raw and intermediate data is necessary. 
 
+## Note
+As of July 1st 2019, the code published is slightly behind the latest version in the data safe haven. The final version will be extracted and merged after publication.
