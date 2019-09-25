@@ -214,15 +214,23 @@ baseline[, fev := factor(fev, levels = rev(sort(unique(fev))))]
 
 # Re-format FEV1 and MRC
 long <- complete(imp_h, action = "long", include = TRUE)
+setDT(long)
+
+long[baseline, on = "patid", age_cat := age_cat]
+long$age_cat_ctr <- fct_relevel(long$age_cat, "60-70")
+long$imd_ctr <- fct_relevel(long$imd, "3")
 
 long$fev <- cut(long$fev_0, c(-Inf, fev_lvls), names(fev_lvls))
 long$fev <- factor(long$fev, levels = rev(names(fev_lvls)))
+long$fev_ctr <- fct_relevel(long$fev, "moderate")
 
 long$mrc <- factor(long$mrc_0, ordered = FALSE)
+long$mrc_ctr <- fct_relevel(long$mrc, "2")
 
 mod_data <- as.mids(long)
 
 mod_data %<>% cbind(fu_ae_cat = baseline$fu_ae_cat) # Remove on next run
+
 
 ```
 
@@ -250,7 +258,6 @@ ref <- function(var){
 
 ```
 
-
 ```{r data-mosaic}
 
 data_mosaic <- function(rates, cnts){
@@ -267,10 +274,12 @@ data_mosaic <- function(rates, cnts){
   dt <- merge(rates, cnts, by = names(rates)[1:2], sort = FALSE)
   
   dt[, n_abx := as.numeric(rate) * cnt] # Number of antibiotics
+  dt[, perc_abx := n_abx / sum(n_abx)]
   
   dt[, id_n := sum(n_abx), by = c(names(rates)[2])]
   dt[, x_end := cumsum(id_n), by = c(names(rates)[1])]
   dt[, x_start := c(0, x_end[-.N]), by = c(names(rates)[1])]
+  dt[, c("x_start", "x_end") := map(.SD, ~ . / sum(n_abx)), .SDcols = c("x_start", "x_end")]
   
   dt[, y_end := .(cumsum(n_abx) / sum(n_abx)), by = c(names(rates)[2])]
   dt[, y_start := c(0, y_end[-.N]), by = c(names(rates)[2])]
@@ -286,15 +295,36 @@ g_mosaic <-
   ggplot(NULL, aes(xmin = x_start, xmax = x_end,
                     ymin = y_start, ymax = y_end, fill = as.numeric(rate))) + 
     geom_rect(colour = "white", size = 2) + 
+    geom_text(aes(x = (x_start + x_end) / 2, y = (y_start + y_end) / 2, 
+                  label = str_c(prty(perc_abx * 100, 1), "%"),
+                  size = pmax(2.5, pmin(6, (x_end - x_start) * 33, (y_end - y_start) * 50))), colour = "white") + 
     scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
                          limits = c(0, 10), breaks = 0:10) + 
-    labs(fill = "Rate per year") + 
+    scale_size_identity() + 
+    labs(fill = "Rate per person-year") + 
+    guides(size = FALSE) + 
     theme_minimal() + 
     theme(panel.grid.minor = element_blank(),
           legend.position = "bottom", 
           legend.box.margin = margin(l = 0, t = 0, r = 0.75, b = 0, unit = "cm"),
           legend.title = element_text(face = "bold", vjust = 0.85),
           legend.key.width = unit(2, "cm"))
+
+```
+
+```{r multivar-coefs}
+
+multi_coefs <- function(mods){
+  coefs <- pool(mods) %>% summary()
+  setDT(coefs, keep.rownames = TRUE)
+  
+  coefs[, rr := prty(exp(estimate), 2)]
+  coefs[, lower := prty(exp(estimate + qnorm(0.025) * std.error), 2)]
+  coefs[, upper := prty(exp(estimate + qnorm(0.975) * std.error), 2)]
+  coefs[, p.value := if_else(p.value < 0.001, "<0.001", prty(p.value, 3))]
+  
+  coefs[, .(rn, rr, ci = str_c("(", lower, "-", upper, ")"), p.value)]
+}
 
 ```
 
@@ -323,7 +353,7 @@ cnt_fev %<>% .[, .(cnt = mean(cnt)), by = .(fev, fu_ae_cat)]
 
 setorder(cnt_fev, fev, fu_ae_cat)
 
-# Table rates
+# Table rates (PUBLICATION: Table 3)
 rates_fev[, lower := rate * exp(qnorm(0.025) * se_rate)]
 rates_fev[, upper := rate * exp(qnorm(0.975) * se_rate)]
 rates_fev[, est := str_c(prty(rate, 2), " (", prty(lower, 2), ",", prty(upper, 2), ")")]
@@ -363,7 +393,32 @@ dcast(cnt_fev[, .(fev, fu_ae_cat, cnt = round(cnt))], fev ~ fu_ae_cat, value.var
 ```
 
 
+```{r fev-multivar}
+
+fev_multi <- with(mod_data, glmmTMB(num_abx ~ age_cat_ctr * female + imd_ctr + 
+                                    asthma + chd + ckd + dm + hf + pad + stroke + obese + smoke + 
+                                    vacc + fev_ctr + (1 | pracid), family = nbinom2, offset = log(risk)))
+
+
+multi_coefs(fev_multi) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Coefficient", "RR", "(95%-CI)", "p-value"),
+    caption = "Multivariate analysis of FEV1"
+  )
+
+
+```
+
+
+
 ```{r fev-hier-mosaic, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with mild COPD with zero AECOPD during follow up were prescribed an average of 1.20 (1.11-1.31) antibiotics per year and accounted for 5.6% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+
+# PUBLICATION SUPPLEMENT: Figure 2
 
 # Plot
 d_fev_fu <- data_mosaic(rates_fev, cnt_fev)
@@ -371,10 +426,12 @@ d_fev_fu <- data_mosaic(rates_fev, cnt_fev)
 g_mosaic %+% d_fev_fu + 
   labs(x = "Number of AECOPD during follow-up\n", y = "FEV1\n") + 
   scale_x_continuous(breaks = with(d_fev_fu[fev == "mild"], x_start + x_end) / 2,
-                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     labels = c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP"), 
                      position = "top") + 
   scale_y_reverse(breaks = with(d_fev_fu[fu_ae_cat == "0"], y_start + y_end) / 2, 
-                  labels = unique(d_fev_fu$fev))
+                  labels = str_c("GOLD ", 1:4)) + 
+    theme(legend.box.margin = margin(l = 0, t = 0, r = 1, b = 0, unit = "cm"),
+          legend.key.width = unit(1.8, "cm"))
 
 
 ```
@@ -404,7 +461,7 @@ cnt_mrc %<>% .[, .(cnt = mean(cnt)), by = .(mrc, fu_ae_cat)]
 
 setorder(cnt_mrc, mrc, fu_ae_cat)
 
-# Table rates
+# Table rates (PUBLICATION: Table 3)
 rates_mrc[, lower := rate * exp(qnorm(0.025) * se_rate)]
 rates_mrc[, upper := rate * exp(qnorm(0.975) * se_rate)]
 rates_mrc[, est := str_c(prty(rate, 2), " (", prty(lower, 2), ",", prty(upper, 2), ")")]
@@ -443,18 +500,43 @@ dcast(cnt_mrc[, .(mrc, fu_ae_cat, cnt = round(cnt))], mrc ~ fu_ae_cat, value.var
 
 ```{r mrc-hier-mosaic, fig.cap="Relationship between disease severity (assessed by MRC score), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 0.97 (0.90-1.05) antibiotics per year and accounted for 4.6% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
 
+# PUBLICATION: Figure 3
+
 # Plot
 d_mrc_fu <- data_mosaic(rates_mrc, cnt_mrc)
 
 g_mosaic %+% d_mrc_fu + 
   labs(x = "Number of AECOPD during follow-up\n", y = "MRC\n") + 
   scale_x_continuous(breaks = with(d_mrc_fu[mrc == "1"], x_start + x_end) / 2,
-                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     labels = c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP"), 
                      position = "top") + 
   scale_y_reverse(breaks = with(d_mrc_fu[fu_ae_cat == "0"], y_start + y_end) / 2, 
-                  labels = unique(d_mrc_fu$mrc))
+                  labels = str_c("MRC ", 1:5))
 
 ```
 
 
+```{r mrc-multivar}
 
+# PUBLICATION: Table 1
+
+mrc_multi <- with(mod_data, glmmTMB(num_abx ~ age_cat_ctr * female + imd_ctr + 
+                              asthma + chd + ckd + dm + hf + pad + stroke + obese + smoke + 
+                              vacc + mrc_ctr + (1 | pracid), family = nbinom2, offset = log(risk)))
+
+multi_coefs(mrc_multi) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Coefficient", "RR", "(95%-CI)", "p-value"),
+    caption = "Multivariate analysis of MRC"
+  )
+
+```
+
+```{r run-all}
+
+```

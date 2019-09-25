@@ -166,6 +166,29 @@ ae_header <- function(tbl, cols = 1, period = "baseline"){
 ```
 
 
+
+```{r tab-sum-perc}
+
+tab_presc_sum <- function(dt, var, group){
+  # Tabulate the total and relative number of prescriptions
+  # within the given group
+  #
+  # Args:
+  #   see `tab_default()`
+  #
+  # Result:
+  #   summarised column
+  
+  dt <- dt[, .(value = `n_%`(sum(num_abx), unique(n_group))), by = c(group, var)]
+  setnames(dt, var, "var")
+  dt
+}
+
+abx_denom <- substitute(sum(num_abx))
+
+```
+
+
 # Tables
 
 (ref:cap-tab-baseline) Baseline characteristics of COPD patients in 2015
@@ -209,13 +232,16 @@ names(base_ord) <- names(tbl_def(tab_default))
 
 # Calculate all measures
 base_counts <- invoke_map(tbl_def(tab_default), .x = list(list(dt = baseline)))
+base_presc <- invoke_map(tbl_def(tab_presc_sum), .x = list(list(dt = baseline, show_miss = FALSE,
+                                                                fun.group = abx_denom, aux = "num_abx")))
 base_rates <- invoke_map(tbl_def(tab_abx_rate), .x = list(list(dt = baseline, show_miss = FALSE,
                                                                   aux = c("risk", "num_abx", "pracid"),
                                                                   cast = c("rate", "ratio"))))
 
 # Render the table with knitr and kableExtra
 tbl_base <- 
-  map2(base_counts, base_rates, merge, by = "var", all.x = TRUE, sort = FALSE) %T>%
+  map2(base_counts, base_presc, merge, by = "var", all.x = TRUE, sort = FALSE) %>% 
+  map2(base_rates, merge, by = "var", all.x = TRUE, sort = FALSE) %T>%
   (function(l) stopifnot(names(l) == names(base_ord))) %>% 
   map2(base_ord, ~ setkey(.x, "var")[(.y)]) %>% 
   walk2(., names(.), ~ if(nrow(.x) == 1) { .x[, var := cell_spec(.y, format, bold = TRUE)] }) %>% 
@@ -232,11 +258,11 @@ tbl_base %>%
     linesep = "",
     align = c("l", rep("r", 3)),
     escape = FALSE,
-    col.names = c("Patient characteristics", "n (\\%)", "Crude Rate (95\\%-CI)", "RR (95\\%-CI)"),
+    col.names = c("Patient characteristics", "n (\\%)", "n (\\%)", "Crude Rate (95\\%-CI)", "Unadj. RR (95\\%-CI)"),
     caption = if(format == "html") "Baseline table" else "(ref:cap-tab-baseline)"
   ) %>% 
   kable_styling() %>% 
-  add_header_above(c(" " = 2, "Number of prescriptions" = 2))%>% 
+  add_header_above(c(" " = 2, "Number of prescriptions" = 3))%>% 
   annotate_table(sections = base_counts)
 
 ```
@@ -799,12 +825,18 @@ tbl_cross <- function(var1, var2, method = "rate", with_ci = TRUE){
     setnames(dt, c(var1, var2), c("var1", "var2"))
     
     res <- dt[, c("var1", "var2", "est", (if(with_ci) "ci" else NULL)), with = FALSE]
-  } else {
+  } else if(method == "count") {
     combs <- expand.grid(levels(baseline[[var1]]), levels(baseline[[var2]]), stringsAsFactors = FALSE)
     res <- pmap_df(combs,
                 ~ data.table(var1 = ..1, 
                              var2 = ..2,
                              est = nrow(baseline[get(var1) == ..1 & get(var2) == ..2])))
+  } else {
+    combs <- expand.grid(levels(baseline[[var1]]), levels(baseline[[var2]]), stringsAsFactors = FALSE)
+    res <- pmap_df(combs,
+                ~ data.table(var1 = ..1, 
+                             var2 = ..2,
+                             est = sum(baseline[get(var1) == ..1 & get(var2) == ..2, num_abx]) / sum(baseline$num_abx)))
   }
   
   if(with_ci & method == "rate"){
@@ -1262,13 +1294,15 @@ tbl_util(~ aecopd, "(ref:cap-tab-util-ae)") %>% ae_header()
 # Figures
 
 
-```{r fig-abx-rate, fig.cap = "Average annual rate of first line, second line and specific antibiotic therapies by the number of AECOPD per year. A. First line antibiotic therapy, B. Second line antibiotic therapy, C. Azithromycin as a marker of phrophylactic antibiotic use in COPD, D. Nitrofurantoin as a marker of prescribing for urinary tract infection, E. Flucloxacillin as a marker for prescribing for skin and soft tissue infections", fig.width=5.5, fig.height=7.1, dpi=300}
+```{r fig-abx-rate, fig.cap = "Average annual rate of first line, second line and specific antibiotic therapies by the number of AECOPD per year. A. First line antibiotic therapy, B. Second line antibiotic therapy, C. Azithromycin as a marker of phrophylactic antibiotic use in COPD, D. Nitrofurantoin as a marker of prescribing for urinary tract infection, E. Flucloxacillin as a marker for prescribing for skin and soft tissue infections", fig.width=5.5, fig.height=7.1, dpi=900}
+
+# PUBLICATION: Plot 1
 
 # Calculate the rates (and percentages) by antibiotic
 abx_rates <- tbl_antibiotics(~ fu_ae_cat, "(ref:cap-tab-abx-fu)", mk_tbl = FALSE)
 
 # Extract the rates and compute point estimates / confidence intervals
-abx_rates <- copy(abx_rates$rate) # copy to get rid of "shallow-copy" data.table message
+abx_rates <- copy(abx_rates$rate[grp != "all"]) # copy to get rid of "shallow-copy" data.table message
 abx_rates[, lower := str_extract(ci, "^.*(?=,)")]
 abx_rates[, upper := str_extract(ci, "(?<=,).*$")]
 abx_rates[, c("rate", "lower", "upper") := map(.SD, as.numeric), .SDcols = c("rate", "lower", "upper")]
@@ -1276,7 +1310,7 @@ abx_rates[, c("rate", "lower", "upper") := map(.SD, as.numeric), .SDcols = c("ra
 
 # Order x-axis
 abx_rates[, grp := factor(grp, c("0", "1", "2", "3+", "1+ severe"), 
-                               c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"))]
+                               c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP"))]
 
 # Define plot
 g <- ggplot(NULL, aes(grp, rate, ymin = lower, ymax = upper, colour = grp)) + 
@@ -1292,33 +1326,33 @@ g <- ggplot(NULL, aes(grp, rate, ymin = lower, ymax = upper, colour = grp)) +
 
 # Plot first line
 g_first <- g %+% 
-  (abx_rates[grp != "all" & var == "first line"] %>% 
+  (abx_rates[var == "first line"] %>% 
            .[, var := "A. First line"])%+%
   aes(size = 1) +
   scale_y_continuous(breaks = 0:7, labels = partial(scales::number, accuracy = 0.1)) + 
   scale_size_identity() + 
-  labs(y = "Rate per year\n") +
+  labs(y = "") +
   coord_cartesian(ylim = c(0, 7))
 
 abx_types <- c("second line", "azithromycin", "nitrofurantoin", "flucloxacillin", "other")
 
 # Shorten the labels for the smaller subplots
-abx_rates[, grp := fct_recode(grp, `1 m.` = "1 mod.", `2 m.` = "2 mod.", 
-                                   `3+ m.` = "3+ mod.", `1+ s.` = "1+ severe")]
+levels(abx_rates$grp) <- c("0", "1 P", "2 P", "\u22653 P", "\u22651 H")
 
 g_other <- g %+% 
-  (abx_rates[grp != "all" & !var %in% c("first line", "other")] %>% 
+  (abx_rates[!var %in% c("first line", "other")] %>% 
            .[, var := factor(var, abx_types, 
                              str_c(c("B", "C", "D", "E", "F"), ". ", str_to_title(abx_types)))]) +
   scale_y_continuous(breaks = c(0, .5, 1)) + 
   coord_cartesian(ylim = c(0, 1.25)) +
-  labs(x = "\nNumber of AECOPD during follow-up", 
-       y = "Rate per year\n") + 
+  labs(x = "\n\nNumber of AECOPD during follow-up", 
+       y = "") + 
   theme(panel.spacing.y = unit(1, "cm"),
         panel.spacing.x = unit(.5, "cm"))
   
 
-ggpubr::ggarrange(g_first, g_other, nrow = 2, ncol = 1, heights = c(2, 3))
+g_comb <- ggpubr::ggarrange(g_first, g_other, nrow = 2, ncol = 1, heights = c(2, 3))
+ggpubr::annotate_figure(g_comb, left = ggpubr::text_grob("Rate per year", rot = 90))
 
 ```
 
@@ -1405,7 +1439,9 @@ ggpubr::ggarrange(g2, g1, ncol = 2, common.legend = TRUE, widths = c(9, 11))
 
 ```
 
-```{r fig-ind, fig.cap="Indication for the antibiotic prescription, grouped by the number of AECOPD during follow-up. Excludes prescriptions with missing indication.", fig.width=6.5, fig.height=3, dpi=300}
+```{r fig-ind, fig.cap="Indication for the antibiotic prescription, grouped by the number of AECOPD during follow-up. Excludes prescriptions with missing indication.", fig.width=6.5, fig.height=3, dpi=900}
+
+# PUBLICATION: Figure 2
 
 fig_ind_data <- add_base(abx_cohort, "fu_ae_cat", nomatch = 0) %>% 
   .[!is.na(system)] %>% 
@@ -1416,6 +1452,8 @@ fig_ind_data <- add_base(abx_cohort, "fu_ae_cat", nomatch = 0) %>%
 
 fig_ind_data[, system := factor(system, levels = c("rt/ent", "urogenital tract", "skin", "other"))]
 fig_ind_data[, condition := factor(condition, levels = c("copd related", "cough", "urti", "other rti", "urogenital tract", "skin", "other"), labels = c("COPD related", "Cough", "URTI", "Other RTI", "Urogenital tract", "Skin", "Other"))]
+fig_ind_data[, fu_ae_cat := factor(as.character(fu_ae_cat), c("0", "1", "2", "3+", "1+ severe"), 
+                               c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP"))]
 
 ggplot(fig_ind_data, aes(system, p, fill = condition)) + 
   geom_col(position = "stack") + 
@@ -1424,7 +1462,7 @@ ggplot(fig_ind_data, aes(system, p, fill = condition)) +
     values = c("#0C2C84", "#225EA8", "#1D91C0", "#41B6C4",
                "#E69F00", "#009E73", "#CC79A7")) + 
   facet_grid(. ~ fu_ae_cat, switch = "x") + 
-  labs(x = "Number of AECOPD during follow-up") + 
+  labs(x = "\nNumber of AECOPD during follow-up") + 
   theme_minimal() + 
   theme(axis.text.x = element_blank(),
         axis.title.y = element_blank(),
@@ -1435,7 +1473,7 @@ ggplot(fig_ind_data, aes(system, p, fill = condition)) +
 
 ```
 
-```{r fig-ind-miss, fig.cap="Proportion of antibiotic prescriptions that are missing a recorded indication, grouped by the number of AECOPD during follow-up", fig.width=6.5, fig.height=3, dpi=300}
+```{r fig-ind-miss, fig.cap="Proportion of antibiotic prescriptions that are missing a recorded indication, grouped by the number of AECOPD during follow-up", fig.width=6.5, fig.height=3, dpi=900}
 
 fig_mis_data <- add_base(abx_cohort, "fu_ae_cat", nomatch = 0) %>% 
   .[, .(fu_ae_cat, miss = is.na(system))] %>% 
@@ -1609,6 +1647,7 @@ data_mosaic <- function(rates, cnts){
   dt <- merge(rates, cnts, by = names(rates)[1:2], sort = FALSE)
   
   dt[, n_abx := as.numeric(rate) * cnt] # Number of antibiotics
+  dt[, perc_abx := n_abx / sum(n_abx)]
   
   dt[, id_n := sum(n_abx), by = c(names(rates)[2])]
   dt[, x_end := cumsum(id_n), by = c(names(rates)[1])]
@@ -1624,9 +1663,14 @@ g_mosaic <-
   ggplot(NULL, aes(xmin = x_start, xmax = x_end,
                     ymin = y_start, ymax = y_end, fill = as.numeric(rate))) + 
     geom_rect(colour = "white", size = 2) + 
+    geom_text(aes(x = (x_start + x_end) / 2, y = (y_start + y_end) / 2, 
+                  label = str_c(prty(perc_abx * 100, 1), "%"),
+                  size = pmax(3, pmin(6, perc_abx * 100))), colour = "white") + 
     scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
                          limits = c(0, 10), breaks = 0:10) + 
-    labs(fill = "Rate per year") + 
+    scale_size_identity() + 
+    labs(fill = "Rate per person-year") + 
+    guides(size = FALSE) + 
     theme_minimal() + 
     theme(panel.grid.minor = element_blank(),
           legend.position = "bottom", 
@@ -1647,7 +1691,7 @@ convert_to_graph <- function(var){
 
 ```
 
-```{r fig-mosaic-sev-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 1.28 (1.20-1.37) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+```{r fig-mosaic-sev-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with mild FEV and zero AECOPD during follow up were prescribed an average of 1.28 (1.20-1.37) antibiotics per year and accounted for 5.1% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=900}
 
 d_sev_fu <- convert_to_graph("fev")
 
@@ -1661,7 +1705,7 @@ g_mosaic %+% d_sev_fu +
 
 ```
 
-```{r fig-mosaic-mrc-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by MRC score), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 1.02 (0.96-1.08) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+```{r fig-mosaic-mrc-fu, warning = FALSE, fig.cap="Relationship between disease severity (assessed by MRC score), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with MRC score 1 with zero AECOPD during follow up were prescribed an average of 1.02 (0.96-1.08) antibiotics per year and accounted for 4.5% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=900}
 
 d_mrc_fu <- convert_to_graph("mrc")
 
@@ -1675,17 +1719,19 @@ g_mosaic %+% d_mrc_fu +
 
 ```
 
-```{r fig-mosaic-ae-fu, warning = FALSE, message= FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with zero AECOPD during baseline and with zero AECOPD during follow up were prescribed an average of 1.22 (1.18-1.27) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=300}
+```{r fig-mosaic-ae-fu, warning = FALSE, message= FALSE, fig.cap="Relationship between disease severity (assessed by FEV1), rate of antibiotic prescribing according to the number of AECOPD and total antibiotic use. Tile sizes are scaled to reflect the proportion of antibiotics that were prescribed to patients in each group. For example, patients with zero AECOPD during baseline and with zero AECOPD during follow up were prescribed an average of 1.22 (1.18-1.27) antibiotics per year and accounted for X% of the total antibiotics prescribed to patients with COPD.", fig.width = 6.5, fig.height = 6.5, dpi=900}
+
+# PUBLICATION SUPPLEMENT: Figure 3
 
 d_ae_fu <- convert_to_graph("aecopd")
 
 g_mosaic %+% d_ae_fu +
   labs(x = "Number of AECOPD during follow-up\n", y = "Number of AECOPD during baseline\n") + 
   scale_x_continuous(breaks = with(d_ae_fu[var1 == "0"], x_start + x_end) / 2,
-                     labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe"), 
+                     labels = c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP"), 
                      position = "top") + 
   scale_y_reverse(breaks = with(d_ae_fu[variable == "0"], y_start + y_end) / 2, 
-                  labels = c("0", "1 mod.", "2 mod.", "3+ mod.", "1+ severe")) +
+                  labels = c("0", "1 PC", "2 PC", "\u22653 PC", "\u22651 HOSP")) +
   scale_fill_viridis_c(option = "magma", begin = 0.05, end = 0.9, 
                          limits = c(0, 11), breaks = 0:11)
 
@@ -1729,17 +1775,100 @@ ref_se <- summary(mod)$coefficients$cond[1, 2]
 ref_ci <- str_c("(", round(ref * exp(qnorm(0.025) * ref_se), 2), "-", 
                      round(ref * exp(qnorm(0.975) * ref_se), 2), ")")
 
-# Plot for comparison
-g_mosaic %+%
-  aes(xmin = 0, xmax = 1, ymin = 0, ymax = 1, fill = ref) + 
-  geom_text(aes(0.5, 0.5, label = str_c(round(ref, 2), " ", ref_ci)), size = 12, colour = "white") + 
-  labs(x = "", y = "") + 
-  guides(fill = FALSE) + 
-  coord_fixed(expand = FALSE) +
-  theme(axis.text = element_blank(), 
-        axis.ticks = element_blank())
+```
+
+
+```{r multivariate_analysis}
+
+multivar <- function(dt, severe_var){
+  # Run the multivariate analysis of severity measures, adjusting for 
+  # all other baseline variables and practice level random effects
+  #
+  # Args:
+  #   dt - data.table containing all baseline measures
+  #   severe_var - name of the severity measure
+  #
+  # Result:
+  #   a glmmTMB model containing the fit
+  
+  form <- as.formula(str_c("num_abx ~ age_cat_ctr * female + imd_ctr + 
+                              asthma + chd + ckd + dm + hf + pad + stroke + obese + smoke + 
+                              vacc + ", severe_var, " + (1 | pracid)"))
+  
+  glmmTMB(form, data = dt, family = nbinom2, offset = log(risk))
+}
+
+multi_coefs <- function(mod){
+  coefs <- tidy(mod)
+  setDT(coefs)
+  coefs %<>% .[component == "cond"]
+  
+  coefs[, rr := prty(exp(estimate), 2)]
+  coefs[, lower := prty(exp(estimate + qnorm(0.025) * std.error), 2)]
+  coefs[, upper := prty(exp(estimate + qnorm(0.975) * std.error), 2)]
+  coefs[, p.value := if_else(p.value < 0.001, "<0.001", prty(p.value, 3))]
+  
+  coefs[, .(term, rr, ci = str_c("(", lower, "-", upper, ")"), p.value)]
+}
 
 ```
+
+
+```{r fev-multivar}
+
+full_fev <- multivar(baseline, "fev_ctr")
+
+multi_coefs(full_fev) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Coefficient", "RR", "(95%-CI)", "p-value"),
+    caption = "Multivariate analysis of FEV1"
+  )
+
+
+```
+
+
+```{r mrc-multivar}
+
+full_mrc <- multivar(baseline, "mrc_ctr")
+
+multi_coefs(full_mrc) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Coefficient", "RR", "(95%-CI)", "p-value"),
+    caption = "Multivariate analysis of FEV1"
+  )
+
+```
+
+
+```{r ae-multivar}
+
+full_ae <- multivar(baseline, "aecopd")
+
+multi_coefs(full_ae) %>% 
+  kable(
+    format, 
+    booktabs = TRUE,
+    linesep = "",
+    align = c("l", rep("r", 3)),
+    escape = FALSE,
+    col.names = c("Coefficient", "RR", "(95%-CI)", "p-value"),
+    caption = "Multivariate analysis of AECOPD during baseline"
+  )
+
+
+```
+
 
 
 

@@ -21,7 +21,7 @@ if(exists(".conn")){
 # Load the base settings and functions
 suppressMessages({
   source("00_init.R")
-  source("00_basic_tables_update.R")
+  source("00_basic_tables.R")
   source("00_code_lists.R")
 })
 
