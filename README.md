@@ -1,4 +1,4 @@
-# Antibiotic presribing in COPD patients in the CPRD database
+# Antibiotic prescribing in COPD patients in the CPRD database
 This is the R code used to analyse the CPRD-HES data for paper "Opportunities to reduce antibiotic prescribing for patients with COPD in primary care: a cohort study using electronic health records from the Clinical Practice Research Datalink (CPRD)" published in the Journal of Antimicrobial Chemotherapy. *Add DOI*
 
 ## Document structure
